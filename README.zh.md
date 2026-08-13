@@ -67,6 +67,8 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 
 想一键切换**团队模式**：把 `preset/team-mode` 目录复制到 `~\.dsh\.agent-presets\team-mode`（dsh 实时发现，无需重启），然后在会话的预设选择器里选 团队模式——它会换用团队主管 persona，让模型默认通过 `deepseek_team` 编排；`/team` 命令仍然可用，用于直接触发。
 
+插件还附带**花名册配置面板**：重启后在 GUI 打开 设置 → 团队模式，即可编辑每个角色的模型、LLM 路由与人设——通过设置文档保存，下一次团队任务即按新路由生效（由 `multiple-deepseek` 设置区段支撑）。
+
 ## 开发
 
 本包源自 deepseek-harness 单仓中的 `@deepseek-ai/dsh-multiple-deepseek`（`packages/team/multiple-deepseek`）。`src/` 是事实来源；`lib/` 是已提交的构建产物，因此基于 git 的安装无需 prepare 脚本。重新构建请检出单仓并运行其 `pnpm run build`；测试（`tests/`）在单仓内用 `pnpm exec vitest run packages/team/multiple-deepseek/tests` 运行。

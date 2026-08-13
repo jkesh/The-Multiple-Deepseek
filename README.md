@@ -67,6 +67,8 @@ Segments split on `|` or newlines; each is `role: task` or a bare task routed to
 
 For a switchable **team mode**, copy the `preset/team-mode` directory to `~\.dsh\.agent-presets\team-mode` (dsh discovers it live), then pick 团队模式 in the session's preset selector: it swaps the lead persona so the model orchestrates through `deepseek_team` by default, while the `/team` command stays available for direct runs.
 
+The plugin also ships a **roster configuration panel**: after a restart, open 设置 → 团队模式 in the GUI to edit each role's model, LLM route, and persona — saved through the settings document and hot-routed on the next team task (the `multiple-deepseek` settings section backs it).
+
 ## Development
 
 This package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`). `src/` is the source of truth; `lib/` is a committed build so git-based installs need no prepare script. To rebuild, check out the monorepo and run its `pnpm run build`; the tests (`tests/`) run inside the monorepo with `pnpm exec vitest run packages/team/multiple-deepseek/tests`.

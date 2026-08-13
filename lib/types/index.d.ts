@@ -66,6 +66,8 @@ export interface Config {
     /** Maximum child depth (default `3`; `0` forbids delegation), or `'provider-managed'` to send no cap. */
     maxDepth?: number | 'provider-managed';
 }
+/** Settings namespace owning the user-editable roster. */
+export declare const SETTINGS_NAMESPACE: import("@deepseek-ai/dsh-settings").SettingsNamespace;
 /** Schemastery schema doubling as the plugin's validated configuration entry. */
 export declare const Config: z<Config>;
 /** A task named a role absent from the roster; the call rejects before any child starts. */
@@ -97,17 +99,21 @@ declare module '@deepseek-ai/cordis' {
 /**
  * Owns the role-to-DeepSeek routing table. The model names a role, never a
  * model: {@link resolve} returns the routed member spec, and the team tool
- * turns it into the child's `AgentOptions` and persona.
+ * turns it into the child's `AgentOptions` and persona. The roster source is
+ * re-read on every call, so a settings-layer change routes the very next
+ * task without a restart.
  */
 export declare class MultipleDeepseekResolver extends Service {
     /** Schemastery schema for the roster facts this service validates. */
     static Config: z<RosterInput>;
-    private readonly roster;
+    private source;
     /**
      * @param ctx - Cordis context registering the `multipleDeepseek` service.
-     * @param config - roster facts; {@link resolveRoster} validates and completes them.
+     * @param source - current roster facts; every lookup resolves and validates
+     *   them, so the composition entry is the initial source and the settings
+     *   wiring re-points it once a settings provider mounts.
      */
-    constructor(ctx: Context, config: RosterInput);
+    constructor(ctx: Context, source: () => RosterInput);
     /**
      * Resolve one role to its routed member spec.
      * @param role - the role id a task named.

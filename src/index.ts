@@ -27,6 +27,7 @@ import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { assertSubagentMaxDepth } from '@deepseek-ai/dsh-subagent'
 import type { SubagentProvider, SubagentResult, SubagentRun, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
@@ -148,6 +149,20 @@ const memberSchema: z<MemberConfig> = z.object({
   persona: z.string(),
 })
 
+/** Settings namespace owning the user-editable roster. */
+export const SETTINGS_NAMESPACE = settingsNamespace('multiple-deepseek')
+
+/**
+ * The roster slice a user may override through the settings document. Every
+ * field is optional in the user layer: the composition entry supplies the
+ * base, and {@link resolveRoster} re-judges the merged value on every use.
+ */
+const rosterSettingsSchema: z<RosterInput> = z.object({
+  llmProvider: z.string(),
+  defaultRole: z.string(),
+  members: z.array(memberSchema),
+})
+
 /** Schemastery schema doubling as the plugin's validated configuration entry. */
 export const Config: z<Config> = z.object({
   provider: z.string().required(),
@@ -246,7 +261,9 @@ declare module '@deepseek-ai/cordis' {
 /**
  * Owns the role-to-DeepSeek routing table. The model names a role, never a
  * model: {@link resolve} returns the routed member spec, and the team tool
- * turns it into the child's `AgentOptions` and persona.
+ * turns it into the child's `AgentOptions` and persona. The roster source is
+ * re-read on every call, so a settings-layer change routes the very next
+ * task without a restart.
  */
 export class MultipleDeepseekResolver extends Service {
   /** Schemastery schema for the roster facts this service validates. */
@@ -256,15 +273,19 @@ export class MultipleDeepseekResolver extends Service {
     members: z.array(memberSchema),
   })
 
-  private readonly roster: ResolvedRoster
+  private source: () => RosterInput
 
   /**
    * @param ctx - Cordis context registering the `multipleDeepseek` service.
-   * @param config - roster facts; {@link resolveRoster} validates and completes them.
+   * @param source - current roster facts; every lookup resolves and validates
+   *   them, so the composition entry is the initial source and the settings
+   *   wiring re-points it once a settings provider mounts.
    */
-  constructor(ctx: Context, config: RosterInput) {
+  constructor(ctx: Context, source: () => RosterInput) {
     super(ctx, 'multipleDeepseek')
-    this.roster = resolveRoster(config)
+    this.source = source
+    // Fail loud at load for the entry roster before any effect registers.
+    resolveRoster(source())
   }
 
   /**
@@ -274,8 +295,9 @@ export class MultipleDeepseekResolver extends Service {
    * @throws {@link UnknownRoleError} when the roster has no such role.
    */
   resolve(role: string): MemberSpec {
-    const member = this.roster.members.find(candidate => candidate.role === role)
-    if (member === undefined) throw new UnknownRoleError(role, this.roster.members.map(spec => spec.role))
+    const roster = resolveRoster(this.source())
+    const member = roster.members.find(candidate => candidate.role === role)
+    if (member === undefined) throw new UnknownRoleError(role, roster.members.map(spec => spec.role))
     return member
   }
 
@@ -284,7 +306,7 @@ export class MultipleDeepseekResolver extends Service {
    * @returns every role and its routed DeepSeek facts.
    */
   listRoles(): readonly MemberSpec[] {
-    return this.roster.members
+    return resolveRoster(this.source()).members
   }
 
   /**
@@ -292,7 +314,7 @@ export class MultipleDeepseekResolver extends Service {
    * @returns the roster's default role id.
    */
   get defaultRole(): string {
-    return this.roster.defaultRole
+    return resolveRoster(this.source()).defaultRole
   }
 }
 
@@ -564,10 +586,20 @@ export function apply(ctx: Context, config: Config): void {
   // Construct the resolver directly: it registers under this plugin's own fiber
   // (so disposal unwinds it), the roster is validated before any other effect
   // registers, and the instance stays local instead of re-read from the store.
-  const roster = new MultipleDeepseekResolver(ctx, {
+  const entryRoster: RosterInput = {
     llmProvider: config.llmProvider ?? DEFAULT_LLM_PROVIDER,
     defaultRole: config.defaultRole ?? DEFAULT_ROLE,
     ...config.members === undefined ? {} : { members: config.members },
+  }
+  let rosterSource: () => RosterInput = () => entryRoster
+  const roster = new MultipleDeepseekResolver(ctx, () => rosterSource())
+  // The roster is also the user-editable settings section: a stored override
+  // routes the very next task, and the settings service rejects a section the
+  // roster validator cannot serve (empty members, unknown defaultRole).
+  installSettingsSection(ctx, SETTINGS_NAMESPACE, rosterSettingsSchema, entryRoster, {
+    setSource: (source) => { rosterSource = source },
+    onChange: () => {},
+    validate: (value) => { resolveRoster(value) },
   })
   const roleMenuText = roleMenu(roster)
 
