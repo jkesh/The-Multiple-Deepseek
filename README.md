@@ -1,4 +1,4 @@
-# The-Multiple-Deepseek
+# The-Multiple-Deepseek(TMD)
 
 Parallel multi-DeepSeek team orchestration plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh), inspired by oh-my-openagent's category-to-model routing.
 
