@@ -10,9 +10,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import CommandRuntime from '@deepseek-ai/dsh-commands'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
@@ -625,3 +626,121 @@ describe('dsh-multiple-deepseek', () => {
     expect(() => roster!.resolve('ghost')).toThrow(plugin.UnknownRoleError)
   })
 })
+describe('dsh-multiple-deepseek /team command', () => {
+  async function commandSetup(
+    pluginConfig: plugin.Config,
+    providerConfig: Partial<scripted.Config> = {},
+  ): Promise<{ ctx: Context; agent: Agent }> {
+    const ctx = new Context()
+    contexts.push(ctx)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(CommandRuntime)
+    await ctx.plugin(scripted, { name: 'mock', ...providerConfig })
+    await ctx.plugin(plugin, pluginConfig)
+    const session = ctx.sessions.create(SessionId('cmd-parent'))
+    const agent = { id: session.id, session } as unknown as Agent
+    return { ctx, agent }
+  }
+
+  it('registers a global team command with the role menu in its hint', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock' })
+    const definition = ctx.commands.find(agent, 'team')
+    expect(definition).toBeDefined()
+    expect(definition!.description).toContain('without a model turn')
+    expect(definition!.input?.hint).toContain('planner — strategic planner')
+    expect(definition!.input?.hint).toContain('quick — fast editor')
+  })
+
+  it('dispatches team tasks through the command without a model turn', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock' }, { reply: 'command reply' })
+    const execution = await ctx.commands.execute(agent, '/team planner: plan X | quick: fix Y', new AbortController().signal)
+    expect(execution?.result).toMatchObject({ kind: 'success' })
+    const textValue = execution?.result.kind === 'success' ? execution.result.text : ''
+    expect(textValue).toContain('command reply')
+    expect(scripted.starts).toHaveLength(2)
+    expect(scripted.starts.map(start => start.agentOptions?.model))
+      .toEqual(['deepseek-v4-pro', 'deepseek-v4-flash'])
+    const lifecycle = agent.session.events
+      .filter(event => event.type === 'command/run' || event.type === 'command/done')
+      .map(event => event.type)
+    expect(lifecycle).toEqual(['command/run', 'command/done'])
+  })
+
+  it('routes a bare segment to the default role', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock', defaultRole: 'quick' })
+    const execution = await ctx.commands.execute(agent, '/team fix the typo', new AbortController().signal)
+    expect(execution?.result.kind).toBe('success')
+    expect(scripted.starts).toHaveLength(1)
+    expect(scripted.starts[0]!.agentOptions?.model).toBe('deepseek-v4-flash')
+  })
+
+  it('rejects an empty input line', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock' })
+    const execution = await ctx.commands.execute(agent, '/team   ', new AbortController().signal)
+    expect(execution?.result).toMatchObject({ kind: 'error' })
+    const settled = execution?.result
+    const textValue = settled?.kind === 'error' ? settled.text : ''
+    expect(textValue).toContain('expected at least one task')
+    expect(scripted.starts).toHaveLength(0)
+  })
+
+  it('rejects an unknown role before dispatching anything', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock' })
+    await expect(ctx.commands.execute(agent, '/team ghost: x', new AbortController().signal))
+      .rejects.toThrow('unknown team role "ghost"')
+    expect(scripted.starts).toHaveLength(0)
+  })
+
+  it('rejects an empty role or an empty task segment', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock' })
+    const emptyRole = await ctx.commands.execute(agent, '/team : x', new AbortController().signal)
+    expect(emptyRole?.result).toMatchObject({ kind: 'error' })
+    const roleText = emptyRole?.result.kind === 'error' ? emptyRole.result.text : ''
+    expect(roleText).toContain('empty role before the colon')
+    const emptyTask = await ctx.commands.execute(agent, '/team planner: ', new AbortController().signal)
+    expect(emptyTask?.result).toMatchObject({ kind: 'error' })
+    const taskText = emptyTask?.result.kind === 'error' ? emptyTask.result.text : ''
+    expect(taskText).toContain('empty task after the colon')
+    expect(scripted.starts).toHaveLength(0)
+  })
+
+  it('reports the tool as unavailable while its provider is absent', async () => {
+    const ctx = new Context()
+    contexts.push(ctx)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(CommandRuntime)
+    await ctx.plugin(plugin, { provider: 'late' })
+    const session = ctx.sessions.create(SessionId('cmd-parent-2'))
+    const agent = { id: session.id, session } as unknown as Agent
+    const execution = await ctx.commands.execute(agent, '/team quick: x', new AbortController().signal)
+    expect(execution?.result).toMatchObject({ kind: 'error' })
+    expect(execution?.result.kind === 'error' && execution.result.text).toContain('provider "late" is not registered')
+  })
+
+  it('surfaces the tool execution error when the team call is rejected', async () => {
+    const { ctx, agent } = await commandSetup({ provider: 'mock', maxTasks: 1 })
+    const execution = await ctx.commands.execute(agent, '/team quick: a | quick: b', new AbortController().signal)
+    expect(execution?.result.kind).toBe('error')
+    const textValue = execution?.result.kind === 'error' ? execution.result.text : ''
+    expect(textValue).toContain('exceed the configured maxTasks')
+    expect(scripted.starts).toHaveLength(0)
+  })
+
+  it('reports the aggregated failure when the team run ends in error', async () => {
+    scripted.outcomeQueue.push({ stopReason: 'error', reply: 'partial' })
+    const { ctx, agent } = await commandSetup({ provider: 'mock' })
+    const execution = await ctx.commands.execute(agent, '/team quick: x', new AbortController().signal)
+    // The tool result itself is not an error, but the team outcome carries the failure.
+    expect(execution?.result.kind).toBe('success')
+    const textValue = execution?.result.kind === 'success' ? execution.result.text : ''
+    expect(textValue).toContain('specialist run failed')
+    expect(textValue).toContain('partial')
+  })
+})
+

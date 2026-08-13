@@ -1,0 +1,4 @@
+# 团队模式预设的展示元数据。
+name: 团队模式 Team Mode
+description: 以 DeepSeek 专家团队主管的身份工作，默认用 deepseek_team 并行分派成员。
+order: 50

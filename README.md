@@ -55,6 +55,18 @@ The plugin imports `@deepseek-ai/dsh-*` and `@deepseek-ai/cordis` as peer depend
 
 The model-facing contract is the `deepseek_team` tool: each task is `{ role?, description, prompt }`; the call waits for all members and returns `{ kind: 'foreground', tasks: [{ index, role, status, runId?, output, error? }] }`, or `{ kind: 'background', jobId }` with `run_in_background: true`. One failing member never aborts the team; partial child output survives in the failure detail.
 
+## Human command and team mode
+
+When the `ctx.commands` seam is mounted (every dsh-base profile), the plugin registers the `team` slash command — dispatch the team directly, without a model turn:
+
+```text
+/team planner: draft a migration plan | quick: fix the README typo
+```
+
+Segments split on `|` or newlines; each is `role: task` or a bare task routed to `defaultRole`. An invalid line or an absent provider reports a readable error.
+
+For a switchable **team mode**, copy the `preset/team-mode` directory to `~\.dsh\.agent-presets\team-mode` (dsh discovers it live), then pick 团队模式 in the session's preset selector: it swaps the lead persona so the model orchestrates through `deepseek_team` by default, while the `/team` command stays available for direct runs.
+
 ## Development
 
 This package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`). `src/` is the source of truth; `lib/` is a committed build so git-based installs need no prepare script. To rebuild, check out the monorepo and run its `pnpm run build`; the tests (`tests/`) run inside the monorepo with `pnpm exec vitest run packages/team/multiple-deepseek/tests`.

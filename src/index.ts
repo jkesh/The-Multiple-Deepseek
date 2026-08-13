@@ -13,14 +13,18 @@
  * (`deepseek-official` from `@deepseek-ai/dsh-llm-deepseek` by default).
  * Specialist personas, the optional tool filter, and the delegation depth cap
  * require a subagent provider advertising the `persona`, `toolFilter`, and
- * `depthLimit` capabilities — the in-process providers do.
+ * `depthLimit` capabilities — the in-process providers do. When the
+ * `ctx.commands` seam is mounted, the plugin additionally registers the
+ * `team` human command, which dispatches the same tool without a model turn.
  * @module @deepseek-ai/dsh-multiple-deepseek
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
+import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { assertSubagentMaxDepth } from '@deepseek-ai/dsh-subagent'
@@ -306,6 +310,62 @@ function roleMenu(roster: MultipleDeepseekResolver): string {
   return roster.listRoles().map(member => `${member.role} — ${member.label}`).join('; ')
 }
 
+/** Human command name registered when the `ctx.commands` seam is mounted. */
+const TEAM_COMMAND_NAME = 'team'
+
+/** One task parsed from a `/team` input line. */
+interface CommandTask {
+  /** Specialist role; omission uses the roster default. */
+  readonly role?: string
+  /** Display label derived from the task text. */
+  readonly description: string
+  /** The specialist task text. */
+  readonly prompt: string
+}
+
+/**
+ * Parse a `/team` input line into team tasks, or a user-facing error.
+ * Segments split on `|` or newlines; each segment is `role: task` or a
+ * bare task routed to the roster default.
+ * @param rawInput - text after the command name.
+ * @returns the parsed tasks, or the reason the line is not usable.
+ */
+function parseTeamCommand(rawInput: string): CommandTask[] | string {
+  const segments = rawInput.split(/[|\n]/u).map(segment => segment.trim()).filter(segment => segment.length > 0)
+  if (segments.length === 0) {
+    return 'team: expected at least one task, e.g. `/team planner: draft a plan | quick: fix the typo`'
+  }
+  const tasks: CommandTask[] = []
+  for (const segment of segments) {
+    const colon = segment.indexOf(':')
+    if (colon === -1) {
+      tasks.push({ description: segment, prompt: segment })
+      continue
+    }
+    const role = segment.slice(0, colon).trim()
+    const prompt = segment.slice(colon + 1).trim()
+    if (role.length === 0) {
+      return 'team: empty role before the colon — name a role or drop the colon'
+    }
+    if (prompt.length === 0) {
+      return 'team: empty task after the colon — write the task text after `role:`'
+    }
+    tasks.push({ role, description: prompt, prompt })
+  }
+  return tasks
+}
+
+/** Join an execution's content blocks into one display string. */
+function blocksText(content: ContentBlock[]): string {
+  return content
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('')
+}
+
+/** Monotonic suffix keeping every command-dispatched tool call id unique. */
+let teamCommandCallCounter = 0
+
 /** A non-`completed` stop reason means the child did not finish cleanly. */
 function stopFailure(result: SubagentResult): string | undefined {
   switch (result.stopReason) {
@@ -510,6 +570,43 @@ export function apply(ctx: Context, config: Config): void {
     ...config.members === undefined ? {} : { members: config.members },
   })
   const roleMenuText = roleMenu(roster)
+
+  // The human command is optional: it registers when the commands seam is
+  // mounted (dsh-base does), and the handler fails loudly while the tool's
+  // provider is absent instead of pretending a team ran.
+  const commands = ctx.get('commands')
+  if (commands !== undefined) {
+    commands.register({
+      name: TEAM_COMMAND_NAME,
+      description: 'Run parallel DeepSeek team tasks directly, without a model turn.',
+      input: { hint: `role: task | role: task — roles: ${roleMenuText}` },
+      handler: async (invocation): Promise<CommandResult> => {
+        const parsed = parseTeamCommand(invocation.rawInput)
+        if (typeof parsed === 'string') return { kind: 'error', text: parsed }
+        if (disposeTool === undefined) {
+          return {
+            kind: 'error',
+            text: `team: deepseek_team is unavailable — subagent provider "${config.provider}" is not registered`,
+          }
+        }
+        // Validate every role before dispatching: an unknown role throws the
+        // roster's UnknownRoleError, which the commands runtime renders as the
+        // command's error result — no partial team starts.
+        for (const item of parsed) {
+          roster.resolve(item.role ?? roster.defaultRole)
+        }
+        const result = await ctx.tools.execute({
+          signal: invocation.signal,
+          callId: CallId(`command-team-${++teamCommandCallCounter}`),
+          name: toolName,
+          arguments: { tasks: parsed },
+          agent: invocation.agent,
+        })
+        const text = blocksText(result.content)
+        return result.isError ? { kind: 'error', text } : { kind: 'success', text }
+      },
+    })
+  }
 
   let disposeTool: (() => void) | undefined
   const mount = (provider: SubagentProvider): void => {

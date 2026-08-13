@@ -55,6 +55,18 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 
 面向模型的契约是 `deepseek_team` 工具：每个任务是 `{ role?, description, prompt }`；调用等待全部成员并返回 `{ kind: 'foreground', tasks: [{ index, role, status, runId?, output, error? }] }`，或配合 `run_in_background: true` 返回 `{ kind: 'background', jobId }`。单个成员失败不会中止整支团队；失败详情中保留子代理的部分输出。
 
+## 人类命令与团队模式
+
+挂载 `ctx.commands` 接缝时（所有 dsh-base profile 都会挂载），插件会注册 `team` 斜杠命令——不经模型回合直接分派团队：
+
+```text
+/team planner: 起草迁移计划 | quick: 修复 README 拼写
+```
+
+输入按 `|` 或换行拆段；每段是 `role: 任务`，或直接路由到 `defaultRole` 的裸任务。无效输入或提供方缺失会返回可读错误。
+
+想一键切换**团队模式**：把 `preset/team-mode` 目录复制到 `~\.dsh\.agent-presets\team-mode`（dsh 实时发现，无需重启），然后在会话的预设选择器里选 团队模式——它会换用团队主管 persona，让模型默认通过 `deepseek_team` 编排；`/team` 命令仍然可用，用于直接触发。
+
 ## 开发
 
 本包源自 deepseek-harness 单仓中的 `@deepseek-ai/dsh-multiple-deepseek`（`packages/team/multiple-deepseek`）。`src/` 是事实来源；`lib/` 是已提交的构建产物，因此基于 git 的安装无需 prepare 脚本。重新构建请检出单仓并运行其 `pnpm run build`；测试（`tests/`）在单仓内用 `pnpm exec vitest run packages/team/multiple-deepseek/tests` 运行。

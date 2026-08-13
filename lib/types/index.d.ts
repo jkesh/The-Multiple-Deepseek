@@ -13,7 +13,9 @@
  * (`deepseek-official` from `@deepseek-ai/dsh-llm-deepseek` by default).
  * Specialist personas, the optional tool filter, and the delegation depth cap
  * require a subagent provider advertising the `persona`, `toolFilter`, and
- * `depthLimit` capabilities — the in-process providers do.
+ * `depthLimit` capabilities — the in-process providers do. When the
+ * `ctx.commands` seam is mounted, the plugin additionally registers the
+ * `team` human command, which dispatches the same tool without a model turn.
  * @module @deepseek-ai/dsh-multiple-deepseek
  */
 import { Context, Service } from '@deepseek-ai/cordis';
