@@ -56,10 +56,9 @@ await build({
   target: 'es2020',
   external: platformExternals,
   banner: {
-    js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(ID)}, factory: (require) => {`,
+    js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(ID)}, factory: (require) => {\nvar module = { exports: {} }; var exports = module.exports;`,
   },
-  intro: { js: 'var module = { exports: {} }; var exports = module.exports;' },
-  footer: { js: 'return module.exports; } });' },
+  footer: { js: '\nreturn module.exports; } });' },
   define: {
     'process.env.NODE_ENV': JSON.stringify('production'),
   },

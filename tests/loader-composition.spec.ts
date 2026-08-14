@@ -35,7 +35,12 @@ afterEach(async () => {
 })
 
 function fakeAgent(id = 'composition-parent'): Agent {
-  return { id: SessionId(id) } as unknown as Agent
+  const sessionId = SessionId(id)
+  return {
+    id: sessionId,
+    options: {},
+    session: { id: sessionId, header: { version: 0, id: sessionId, createdAt: 0 } },
+  } as unknown as Agent
 }
 
 async function loadComposition(): Promise<{ ctx: Context }> {

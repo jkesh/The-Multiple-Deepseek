@@ -28,7 +28,7 @@ import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
-import { assertSubagentMaxDepth } from '@deepseek-ai/dsh-subagent'
+import { assertSubagentMaxDepth, delegationDepthOf, SubagentDepthError } from '@deepseek-ai/dsh-subagent'
 import type { SubagentProvider, SubagentResult, SubagentRun, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
 import type {
@@ -408,7 +408,7 @@ function stopFailure(result: SubagentResult): string | undefined {
   }
 }
 
-/** A task failure that still carries the child's partial answer for the parent model. */
+/** One task failure that still carries the child's partial answer for the parent model. */
 class TeamTaskFailure extends Error {
   /**
    * @param message - the stop-reason headline.
@@ -418,6 +418,47 @@ class TeamTaskFailure extends Error {
     super(message)
     this.name = 'TeamTaskFailure'
   }
+}
+
+/**
+ * A delegation-depth rejection, reported once and terminally so the parent
+ * model stops retrying instead of looping on the same refusal. A numeric
+ * `maxDepth` caps the depth children may run at; once the parent itself sits
+ * at that depth, every further team call would spawn children beyond the cap
+ * and fail identically, so the call rejects before any child starts.
+ */
+export class TeamDepthLimitError extends Error {
+  /** The parent agent's current delegation depth. */
+  readonly parentDepth: number
+  /** The configured absolute child-depth cap. */
+  readonly maxDepth: number
+
+  /**
+   * @param parentDepth - the calling agent's delegation depth.
+   * @param maxDepth - the configured child-depth cap.
+   */
+  constructor(parentDepth: number, maxDepth: number) {
+    super(
+      `deepseek_team: delegation depth limit reached — this agent is already at depth ${parentDepth} `
+      + `and maxDepth is ${maxDepth}, so a team here would run children beyond the cap. Do not call `
+      + 'deepseek_team again; finish the task directly in this session instead of delegating further.',
+    )
+    this.name = 'TeamDepthLimitError'
+    this.parentDepth = parentDepth
+    this.maxDepth = maxDepth
+  }
+}
+
+/** Map a provider-start rejection to a stable, terminal task message. */
+function startFailureMessage(error: unknown, parentDepth: number, maxDepth: number | 'provider-managed'): string {
+  if (error instanceof SubagentDepthError) {
+    return `specialist delegation refused: subagent depth ${error.attemptedDepth} exceeds maxDepth ${error.maxDepth}. `
+      + 'The delegation budget is exhausted — do not delegate further; finish the task directly.'
+  }
+  if (error instanceof TeamDepthLimitError) {
+    return `delegation depth limit reached (depth ${parentDepth}, maxDepth ${maxDepth}) — do not delegate further`
+  }
+  return String(error)
 }
 
 /** Extend a stop-reason headline with the child's preserved partial text. */
@@ -462,6 +503,8 @@ async function settleTeamTask(
   entry: TeamEntry,
   buildRequest: (entry: TeamEntry, signal: AbortSignal) => SubagentStartRequest,
   signal: AbortSignal,
+  parent: import('@deepseek-ai/dsh-agent').Agent,
+  maxDepth: number | 'provider-managed',
 ): Promise<TeamTaskOutcome> {
   const base = { index: entry.index, role: entry.member.role }
   let run: SubagentRun
@@ -473,7 +516,7 @@ async function settleTeamTask(
       ...base,
       status: signal.aborted ? 'killed' as const : 'failed' as const,
       output: [],
-      error: String(error),
+      error: startFailureMessage(error, delegationDepthOf(parent), maxDepth),
     }
   }
   const [execution] = await Promise.allSettled([
@@ -550,8 +593,10 @@ async function runTeam(
   maxParallel: number,
   signal: AbortSignal,
   buildRequest: (entry: TeamEntry, signal: AbortSignal) => SubagentStartRequest,
+  parent: import('@deepseek-ai/dsh-agent').Agent,
+  maxDepth: number | 'provider-managed',
 ): Promise<TeamTaskOutcome[]> {
-  return mapWithLimit(entries, maxParallel, entry => settleTeamTask(ctx, providerName, entry, buildRequest, signal))
+  return mapWithLimit(entries, maxParallel, entry => settleTeamTask(ctx, providerName, entry, buildRequest, signal, parent, maxDepth))
 }
 
 /** Project aggregated team outcomes onto the one terminal job outcome the jobs seam accepts. */
@@ -667,7 +712,8 @@ export function apply(ctx: Context, config: Config): void {
       description: 'Coordinate a team of multiple DeepSeek specialists. Each task names a specialist role, '
         + 'and the role selects its DeepSeek model and specialist instructions automatically — name the kind '
         + 'of work, never a model. Tasks run in parallel; this call waits for every member and returns one '
-        + 'result per task.'
+        + 'result per task. A delegation-depth limit prevents runaway nested teams: if the calling agent '
+        + 'is already at or above the configured maxDepth, the call is rejected before any member starts.'
         + (backgroundEnabled
           ? ' Set `run_in_background: true` to run the whole team as a background job and collect it with `job_output`.'
           : ''),
@@ -772,6 +818,15 @@ export function apply(ctx: Context, config: Config): void {
         if (args.run_in_background === true && !backgroundEnabled) {
           throw new Error('run_in_background is disabled for this tool instance (enableRunInBackground: false)')
         }
+        // Preflight depth guard: if the parent already sits at or above the
+        // absolute child-depth cap, every team member would exceed it, so fail
+        // before any delegation overhead.
+        if (typeof config.maxDepth === 'number') {
+          const parentDepth = delegationDepthOf(parent)
+          if (parentDepth >= config.maxDepth) {
+            throw new TeamDepthLimitError(parentDepth, config.maxDepth)
+          }
+        }
         // Resolve every role before the first start so an unknown role rejects the
         // whole call instead of launching a partial team.
         const entries: TeamEntry[] = tasks.map((task, index) => ({
@@ -804,7 +859,7 @@ export function apply(ctx: Context, config: Config): void {
               // runTeam captures every per-task failure, so `done` settles with the
               // aggregate outcome instead of rejecting; the jobs runtime maps an
               // unexpected rejection to `failed` at its own boundary.
-              const done = runTeam(ctx, config.provider, entries, maxParallel, controller.signal, buildRequest)
+              const done = runTeam(ctx, config.provider, entries, maxParallel, controller.signal, buildRequest, parent, config.maxDepth)
                 .then(summarizeTeam)
               return {
                 cancel: (reason?: string) => {
@@ -818,7 +873,7 @@ export function apply(ctx: Context, config: Config): void {
         }
         return {
           kind: 'foreground' as const,
-          tasks: await runTeam(ctx, config.provider, entries, maxParallel, exec.signal, buildRequest),
+          tasks: await runTeam(ctx, config.provider, entries, maxParallel, exec.signal, buildRequest, parent, config.maxDepth),
         } satisfies TeamForegroundResult
       },
     }))
@@ -848,6 +903,9 @@ export function apply(ctx: Context, config: Config): void {
       : `Use ${toolName} to run several DeepSeek specialists in parallel. Pick a role per task: ${roleMenuText}. `
         + 'The role routes the task to its DeepSeek model and specialist instructions — name the kind of work, '
         + 'never a model. Batch independent tasks into one call and wait for all results; reserve a follow-up '
-        + 'call for work that depends on a finished member\'s output.',
+        + 'call for work that depends on a finished member\'s output. '
+        + (typeof config.maxDepth === 'number'
+          ? `Delegation is capped at depth ${config.maxDepth}: when the session is already at that depth the call fails, preventing runaway delegation. `
+          : 'The subagent provider manages the delegation budget; no hard depth cap is enforced from this side. '),
   })
 }

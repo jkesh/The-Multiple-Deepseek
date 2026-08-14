@@ -4,8 +4,15 @@
 # 通过 deepseek_team 并行分派专家成员。deepseek_team 工具本身由 profile
 # 层的 the-multiple-deepseek 行提供（本预设不再挂载插件，避免服务重复注册）。
 #
+# 本预设只包含基本插件：persona 切换、agent 指令、以及最少的交互工具。
+# 高级工具（subagent、workflow、ralph、compaction、goals、skills、plan-mode）
+# 不属于 team-mode 的核心用途，由其他预设或 profile 层提供。
+#
 # 用法：把本目录复制到 ~/.dsh/.agent-presets/team-mode/（dsh 会实时发现，
 # 无需重启），然后在会话的预设选择器或 settings.yaml 中选用。
+
+# ── identity ────────────────────────────────────────────────────────────────
+
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
@@ -16,3 +23,23 @@
       reviewer — adversarial review; explorer — codebase research; quick — small fast edits. Batch
       independent tasks into one call, wait for every member, aggregate their results, and drive the
       objective to completion. Use the /team command yourself when a human asks for a direct team run.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── basic tools the team lead uses ──────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    searchTimeoutMs: 60000

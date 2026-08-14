@@ -16,7 +16,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import SubagentRuntime from '@deepseek-ai/dsh-subagent'
+import SubagentRuntime, { SubagentDepthError } from '@deepseek-ai/dsh-subagent'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import * as ToolTasks from '@deepseek-ai/dsh-tool-jobs'
 import { JobId } from '@deepseek-ai/dsh-jobs'
@@ -27,7 +27,22 @@ const testToolSignal = new AbortController().signal
 
 /** A minimal parent Agent passed through to the provider request. */
 function fakeAgent(id = 'parent-1'): Agent {
-  return { id: SessionId(id) } as unknown as Agent
+  const sessionId = SessionId(id)
+  return {
+    id: sessionId,
+    options: {},
+    session: { id: sessionId, header: { version: 0, id: sessionId, createdAt: 0 } },
+  } as unknown as Agent
+}
+
+/** A parent agent carrying a persisted delegation depth, for depth-guard tests. */
+function depthAgent(depth: number, id = 'parent-deep'): Agent {
+  const sessionId = SessionId(id)
+  return {
+    id: sessionId,
+    options: {},
+    session: { id: sessionId, header: { version: 0, id: sessionId, createdAt: 0, delegationDepth: depth } },
+  } as unknown as Agent
 }
 
 let contexts: Context[] = []
@@ -586,6 +601,47 @@ describe('dsh-multiple-deepseek', () => {
       .rejects.toThrow('cannot scope child tools')
   })
 
+  it('rejects a team call whose parent already sits at the maxDepth cap', async () => {
+    const ctx = await setup({ provider: 'mock', maxDepth: 3 })
+    const result = await callTeam(ctx, { tasks: [task('quick', 'a', 'a')] }, { agent: depthAgent(3) })
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('delegation depth limit reached')
+    expect(text(result)).toContain('depth 3')
+    expect(scripted.starts).toHaveLength(0)
+  })
+
+  it('allows a team call from a parent below the maxDepth cap', async () => {
+    const ctx = await setup({ provider: 'mock', maxDepth: 3 })
+    const result = await callTeam(ctx, { tasks: [task('quick', 'a', 'a')] }, { agent: depthAgent(2) })
+    expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected team success')
+    expect(scripted.starts).toHaveLength(1)
+    expect(scripted.starts[0]!.maxDepth).toBe(3)
+  })
+
+  it('does not apply a preflight depth guard when maxDepth is provider-managed', async () => {
+    const ctx = await setup({ provider: 'mock', maxDepth: 'provider-managed' })
+    const result = await callTeam(ctx, { tasks: [task('quick', 'a', 'a')] }, { agent: depthAgent(9) })
+    expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected team success')
+    expect(scripted.starts).toHaveLength(1)
+    expect(scripted.starts[0]!.maxDepth).toBeUndefined()
+  })
+
+  it('reports a provider SubagentDepthError as a stable terminal task failure', async () => {
+    scripted.outcomeQueue.push({ startErrorInstance: new SubagentDepthError(4, 3) })
+    const ctx = await setup({ provider: 'mock' })
+    const result = await callTeam(ctx, { tasks: [task('quick', 'a', 'a')] })
+    expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected team success')
+    const tasks = tasksOf(result) as Array<{ status: string; error?: string; output: unknown[] }>
+    expect(tasks[0]).toMatchObject({ status: 'failed', output: [] })
+    expect(tasks[0]!.error).toContain('specialist delegation refused')
+    expect(tasks[0]!.error).toContain('subagent depth 4 exceeds maxDepth 3')
+    expect(tasks[0]!.error).toContain('do not delegate further')
+    expect(tasks[0]!.runId).toBeUndefined()
+  })
+
   it('registers the tool only once its provider appears and removes it on provider removal', async () => {
     const ctx = await baseContext()
     await ctx.plugin(plugin, { provider: 'late' })
@@ -641,7 +697,7 @@ describe('dsh-multiple-deepseek /team command', () => {
     await ctx.plugin(scripted, { name: 'mock', ...providerConfig })
     await ctx.plugin(plugin, pluginConfig)
     const session = ctx.sessions.create(SessionId('cmd-parent'))
-    const agent = { id: session.id, session } as unknown as Agent
+    const agent = { id: session.id, session, options: {} } as unknown as Agent
     return { ctx, agent }
   }
 
@@ -717,7 +773,7 @@ describe('dsh-multiple-deepseek /team command', () => {
     await ctx.plugin(CommandRuntime)
     await ctx.plugin(plugin, { provider: 'late' })
     const session = ctx.sessions.create(SessionId('cmd-parent-2'))
-    const agent = { id: session.id, session } as unknown as Agent
+    const agent = { id: session.id, session, options: {} } as unknown as Agent
     const execution = await ctx.commands.execute(agent, '/team quick: x', new AbortController().signal)
     expect(execution?.result).toMatchObject({ kind: 'error' })
     expect(execution?.result.kind === 'error' && execution.result.text).toContain('provider "late" is not registered')

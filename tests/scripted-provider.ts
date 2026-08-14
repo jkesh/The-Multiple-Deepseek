@@ -45,6 +45,8 @@ export interface ScriptedOutcome {
   stopReason?: string
   /** Rejects the start before publication with this message. */
   startError?: string
+  /** Rejects the start before publication with this exact error instance. */
+  startErrorInstance?: Error
   /** Replaces the child output content blocks entirely. */
   output?: ContentBlock[]
   /** Rejects the published run's result promise with this message. */
@@ -92,6 +94,7 @@ class ScriptedSubagentProvider implements SubagentProvider {
       request.signal.removeEventListener('abort', onAbort)
       throw new Error('scripted subagent start aborted before publication')
     }
+    if (queued?.startErrorInstance !== undefined) throw queued.startErrorInstance
     if (queued?.startError !== undefined) throw new Error(queued.startError)
     starts.push(request)
     for (const gate of [...startGates]) await gate(request)
