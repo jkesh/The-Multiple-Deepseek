@@ -84,22 +84,59 @@ async fn launch_dsh(window: WebviewWindow, state: tauri::State<'_, RuntimeState>
     window.navigate(url).map_err(|error| format!("无法打开 DSH 页面：{error}"))
 }
 
+fn take_runtime(state: &RuntimeState) -> Option<Child> {
+    state.0.lock().ok().and_then(|mut runtime| runtime.take())
+}
+
+/// Stop the dsh sidecar we own. The child is `cmd /C dsh web`; killing only
+/// that direct process leaves the nested `cmd`/`node` descendants behind, so
+/// on Windows the whole tree is terminated with `taskkill /T` first.
+#[cfg(target_os = "windows")]
+fn stop_runtime(state: &RuntimeState) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Some(mut child) = take_runtime(state) else {
+        return;
+    };
+    let pid = child.id();
+    let pid_arg = pid.to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid_arg, "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    // Fallback in case taskkill is unavailable; also reaps the child handle.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_runtime(state: &RuntimeState) {
+    if let Some(mut child) = take_runtime(state) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(RuntimeState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![launch_dsh])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 if let Some(state) = window.try_state::<RuntimeState>() {
-                    if let Ok(mut runtime) = state.0.lock() {
-                        if let Some(child) = runtime.as_mut() {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                    }
+                    stop_runtime(&state);
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run TMD desktop application");
+        .build(tauri::generate_context!())
+        .expect("failed to build TMD desktop application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(state) = app_handle.try_state::<RuntimeState>() {
+                stop_runtime(&state);
+            }
+        }
+    });
 }
