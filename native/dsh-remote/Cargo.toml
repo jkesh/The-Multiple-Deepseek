@@ -16,3 +16,7 @@ path = "src/bin/smoke.rs"
 [[bin]]
 name = "dsh-chat"
 path = "src/bin/chat.rs"
+
+[[bin]]
+name = "dsh-healthprobe"
+path = "src/bin/healthprobe.rs"

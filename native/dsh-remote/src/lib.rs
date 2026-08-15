@@ -267,6 +267,49 @@ impl DshClient {
             .map_err(|error| RemoteError::Json(format!("respond receipt: {error}")))
     }
 
+    /// Heartbeat: true when the backend's `/api/health` answers ok.
+    /// Older dsh builds without the lifecycle routes fall back to the
+    /// boot-marker scan of the served index page.
+    pub fn health(&self) -> bool {
+        if let Ok((200, body)) = self.http_get("/api/health") {
+            if body.windows(9).any(|window| window == b"{\"ok\":true}") {
+                return true;
+            }
+        }
+        matches!(
+            self.http_get("/"),
+            Ok((200, body)) if body.windows(19).any(|window| window == b"window.__DSH_BOOT__")
+        )
+    }
+
+    /// Graceful shutdown command: `POST /api/shutdown` (202 = accepted).
+    pub fn request_shutdown(&self) -> bool {
+        matches!(self.http_post("/api/shutdown", b"{}"), Ok((200 | 202, _)))
+    }
+
+    /// Raw HTTP GET with Connection close (no-envelope read channels).
+    fn http_get(&self, path: &str) -> Result<(u16, Vec<u8>), RemoteError> {
+        let address = self.socket_addr()?;
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+            .map_err(|error| RemoteError::Connect(format!("{address}: {error}")))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|error| RemoteError::Io(error.to_string()))?;
+        let authority = format!("{}:{}", self.host, self.port);
+        let head = format!(
+            "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .map_err(|error| RemoteError::Io(error.to_string()))?;
+        let mut raw = Vec::new();
+        stream
+            .take(MAX_BODY_BYTES as u64 + MAX_HEADER_BYTES as u64)
+            .read_to_end(&mut raw)
+            .map_err(|error| RemoteError::Io(error.to_string()))?;
+        parse_http_response(&raw)
+    }
+
     /// Raw HTTP POST with Content-Type json and Connection close.
     fn http_post(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), RemoteError> {
         let address = self.socket_addr()?;

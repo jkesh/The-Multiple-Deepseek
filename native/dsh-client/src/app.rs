@@ -1,7 +1,7 @@
 //! GUI state and rendering: session sidebar, streaming transcript,
 //! composer, model/preset pickers, approval and question modals.
 
-use crate::backend::{Backend, BackendHandle, Event};
+use crate::backend::{Backend, BackendHandle, BackendStatus, Event};
 use dsh_remote::chat::{StreamChunk, Transcript};
 use egui::containers::panel::{CentralPanel, Panel};
 use dsh_remote::domains::{ApprovalOutcome, ApprovalRequested, ModelProviderGroup, ModelSelection, QuestionRequested};
@@ -70,10 +70,17 @@ pub struct App {
     picker_preset: Option<String>,
     md_cache: egui_commonmark::CommonMarkCache,
     scroll_bottom: bool,
+    backend_status: BackendStatus,
+    show_settings: bool,
+    settings_cache: Option<Vec<dsh_remote::domains::SettingsNamespaceView>>,
+    goal: Option<Value>,
+    goal_objective: String,
+    show_goal_dialog: bool,
+    auto_exit: Option<std::time::Instant>,
 }
 
 impl App {
-    pub fn new(base: &str) -> Self {
+    pub fn new(base: &str, _ctx: egui::Context) -> Self {
         let mut app = App {
             backend: None,
             base_url: base.to_string(),
@@ -96,6 +103,16 @@ impl App {
             picker_preset: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
             scroll_bottom: false,
+            backend_status: BackendStatus { running: false, owned: false },
+            show_settings: false,
+            settings_cache: None,
+            goal: None,
+            goal_objective: String::new(),
+            show_goal_dialog: false,
+            auto_exit: std::env::var("DSH_AUTO_EXIT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|millis| std::time::Instant::now() + std::time::Duration::from_millis(millis)),
         };
         app.connect();
         app
@@ -103,8 +120,9 @@ impl App {
 
     fn connect(&mut self) {
         self.status = "正在连接…".to_string();
-        match Backend::connect(&self.base_url) {
+        match Backend::connect(&self.base_url, sidecar_argv()) {
             Ok(backend) => {
+                self.backend_status.running = backend.handle().client().health();
                 self.backend = Some(backend);
                 self.refresh_sessions();
                 self.refresh_presets();
@@ -355,6 +373,9 @@ impl App {
                         self.connected = true;
                         self.refresh_sessions();
                     }
+                    Event::Status(status) => {
+                        self.backend_status = status;
+                    }
                 }
             }
         }
@@ -424,6 +445,17 @@ impl App {
             "question/resolved" => {
                 self.questions.retain(|pending| pending.rpc_id != frame.rpc_id);
             }
+            "session/projection" => {
+                let session_id = frame.payload.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+                if self.selected.as_deref() != Some(session_id) {
+                    return;
+                }
+                let key = frame.payload.get("key").and_then(Value::as_str).unwrap_or_default();
+                if key == "goal" {
+                    let value = frame.payload.get("value").cloned().unwrap_or(Value::Null);
+                    self.goal = if value.is_null() { None } else { Some(value) };
+                }
+            }
             _ => {}
         }
     }
@@ -431,15 +463,34 @@ impl App {
     // -- UI -----------------------------------------------------------------
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut start_backend = false;
+        let mut stop_backend = false;
         Panel::top("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (color, label) = if self.connected {
-                    (egui::Color32::from_rgb(61, 220, 132), "已连接")
+                let (color, label) = if self.backend_status.running {
+                    (egui::Color32::from_rgb(61, 220, 132), "后台运行中")
+                } else if self.backend_status.owned {
+                    (egui::Color32::from_rgb(245, 185, 68), "后台启动中…")
                 } else {
-                    (egui::Color32::from_rgb(242, 84, 75), "未连接")
+                    (egui::Color32::from_rgb(242, 84, 75), "后台已停止")
                 };
                 ui.colored_label(color, "●");
                 ui.label(label);
+                if self.backend_status.running {
+                    ui.label(if self.backend_status.owned { "（本程序管理）" } else { "（外部进程）" });
+                }
+                if !self.backend_status.running
+                    && !self.backend_status.owned
+                    && ui.button("启动后台").clicked()
+                {
+                    start_backend = true;
+                }
+                if self.backend_status.running
+                    && self.backend_status.owned
+                    && ui.button("停止后台").clicked()
+                {
+                    stop_backend = true;
+                }
                 ui.separator();
                 ui.label(&self.status);
                 ui.separator();
@@ -450,10 +501,25 @@ impl App {
                     if ui.button("新建会话").clicked() {
                         self.new_session();
                     }
+                    if ui.button("设置").clicked() {
+                        self.show_settings = true;
+                    }
                     ui.label(&self.base_url);
                 });
             });
         });
+        if start_backend {
+            if let Some(backend) = &self.backend {
+                backend.handle().start_backend();
+            }
+            self.status = "正在启动后台…".to_string();
+        }
+        if stop_backend {
+            if let Some(backend) = &self.backend {
+                backend.handle().stop_backend();
+            }
+            self.status = "正在停止后台…".to_string();
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -582,6 +648,42 @@ impl App {
                 });
             if ui.button("应用预设").clicked() {
                 apply_preset = true;
+            }
+
+            ui.separator();
+            ui.label("目标");
+            match &self.goal {
+                Some(goal) => {
+                    let objective = goal.get("objective").and_then(Value::as_str).unwrap_or("(无)");
+                    let phase = goal.get("phase").and_then(Value::as_str).unwrap_or("-");
+                    let id = goal.get("id").and_then(Value::as_str).unwrap_or("");
+                    let revision = goal.get("revision").and_then(Value::as_u64).unwrap_or(0);
+                    ui.add(egui::Label::new(objective).wrap());
+                    ui.label(format!("状态：{phase}"));
+                    let mut goal_action: Option<&str> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, action) in [("暂停", "goal.pause"), ("恢复", "goal.resume"), ("完成", "goal.complete"), ("清除", "goal.clear")] {
+                            if ui.button(label).clicked() {
+                                goal_action = Some(action);
+                            }
+                        }
+                    });
+                    if let Some(action) = goal_action {
+                        let payload = serde_json::json!({
+                            "sessionId": &session_id,
+                            "ref": { "id": id, "revision": revision }
+                        });
+                        if let Some(Err(error)) = self.backend().map(|backend| backend.call(action, payload)) {
+                            self.status = format!("目标操作失败：{error}");
+                        }
+                    }
+                }
+                None => {
+                    ui.label("无目标");
+                }
+            }
+            if ui.button("新建目标").clicked() {
+                self.show_goal_dialog = true;
             }
 
             ui.separator();
@@ -791,17 +893,126 @@ impl App {
     }
 }
 
+impl App {
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        egui::Window::new("设置（只读视图）")
+            .id(egui::Id::new("settings_window"))
+            .default_width(520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.settings_cache.is_none() {
+                    if let Some(backend) = self.backend() {
+                        if let Ok(describe) = backend.client().describe_settings() {
+                            self.settings_cache = Some(describe.namespaces);
+                        }
+                    }
+                }
+                if ui.button("刷新").clicked() {
+                    self.settings_cache = None;
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let namespaces = self.settings_cache.clone().unwrap_or_default();
+                    for namespace in namespaces {
+                        egui::CollapsingHeader::new(format!(
+                            "{} · applies={} · revision={}",
+                            namespace.ns, namespace.applies, namespace.revision
+                        ))
+                        .id_salt(("ns", &namespace.ns))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    serde_json::to_string_pretty(&namespace.value).unwrap_or_default(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+                });
+            });
+        self.show_settings = open;
+    }
+
+    fn goal_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_goal_dialog {
+            return;
+        }
+        let mut open = self.show_goal_dialog;
+        let mut create = false;
+        egui::Window::new("新建目标")
+            .id(egui::Id::new("goal_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.goal_objective).desired_rows(3).hint_text("目标描述"));
+                if ui.button("创建").clicked() {
+                    create = true;
+                }
+            });
+        self.show_goal_dialog = open;
+        if create {
+            let objective = self.goal_objective.trim().to_string();
+            if !objective.is_empty() {
+                if let (Some(backend), Some(session_id)) = (self.backend(), self.selected.clone()) {
+                    let payload = serde_json::json!({ "sessionId": session_id, "objective": objective });
+                    match backend.call("goal.create", payload) {
+                        Ok(_) => {
+                            self.goal_objective.clear();
+                            self.status = "目标已创建".to_string();
+                        }
+                        Err(error) => self.status = format!("创建目标失败：{error}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if let Some(deadline) = self.auto_exit {
+            if std::time::Instant::now() >= deadline {
+                self.auto_exit = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
         self.drain(&ctx);
         self.modals(&ctx);
+        self.settings_window(&ctx);
+        self.goal_dialog(&ctx);
         self.status_bar(ui);
         self.sidebar(ui);
         self.inspector(ui);
         self.transcript_ui(ui);
         self.composer_ui(ui);
     }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.take() {
+            backend.shutdown();
+        }
+    }
+}
+
+/// Sidecar argv for `dsh web`: DSH_SIDECAR_CMD overrides (whitespace-split),
+/// DSH_NO_SIDECAR=1 disables sidecar management.
+fn sidecar_argv() -> Option<Vec<String>> {
+    if std::env::var("DSH_NO_SIDECAR").is_ok() {
+        return None;
+    }
+    if let Ok(command) = std::env::var("DSH_SIDECAR_CMD") {
+        let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+        return if argv.is_empty() { None } else { Some(argv) };
+    }
+    Some(vec!["dsh".to_string(), "web".to_string()])
 }
 
 fn short_id(id: &str) -> String {

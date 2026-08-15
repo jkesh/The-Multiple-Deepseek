@@ -48,7 +48,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |creation_context| {
             setup_fonts(&creation_context.egui_ctx);
-            Ok(Box::new(app::App::new(&base)))
+            Ok(Box::new(app::App::new(&base, creation_context.egui_ctx.clone())))
         }),
     )
 }

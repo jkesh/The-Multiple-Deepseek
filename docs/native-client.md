@@ -102,3 +102,14 @@ Pending entries survive disconnects and replay on reconnect.
    of pending approvals/questions.
 4. **M4 packaging** — egui window, spawn `dsh web` sidecar lifecycle (port
    of the Tauri shell's start/stop/heartbeat), NSIS installer, CI.
+
+## Status (verified live)
+
+M1 transport, M2 chat core, and M3 product domains are implemented in
+`native/dsh-remote` and verified against the live backend. M4 ships the
+`dsh-client` egui application. The sidecar lifecycle is done and verified
+end-to-end: the client health-checks `/api/health` (falling back to the
+boot-marker scan for older dsh builds), spawns `dsh web` when the backend is
+down, exposes start/stop buttons plus heartbeat status, and on window close
+stops the backend (graceful `/api/shutdown` when available, process-tree
+cleanup otherwise). Packaging (NSIS installer + CI) is the remaining item.
