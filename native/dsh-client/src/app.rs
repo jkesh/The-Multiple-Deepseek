@@ -4,7 +4,7 @@
 use crate::backend::{Backend, BackendHandle, BackendStatus, Event};
 use dsh_remote::chat::{StreamChunk, Transcript};
 use egui::containers::panel::{CentralPanel, Panel};
-use dsh_remote::domains::{ApprovalOutcome, ApprovalRequested, ModelProviderGroup, ModelSelection, QuestionRequested};
+use dsh_remote::domains::{ApprovalOutcome, ApprovalRequested, ModelProviderGroup, ModelSelection, PathOp, QuestionRequested};
 use dsh_remote::model::{SessionEvent, SessionSummary};
 use serde::Deserialize;
 use serde_json::Value;
@@ -42,6 +42,14 @@ struct PendingQuestion {
 /// (id, label) preset rows for the picker.
 type PresetRow = (String, String);
 
+/// Editing state for one settings namespace: the resolved value is cloned for
+/// editing; saving diffs against the original into path-addressed ops.
+struct SettingsEditState {
+    ns: String,
+    revision: u64,
+    edited: Value,
+}
+
 /// One deferred modal action, applied after the borrow-heavy modal loop.
 enum ModalAction {
     AnswerApproval { rpc_id: String, session_id: String, approval_id: String, outcome: ApprovalOutcome },
@@ -77,6 +85,10 @@ pub struct App {
     goal_objective: String,
     show_goal_dialog: bool,
     auto_exit: Option<std::time::Instant>,
+    settings_edit: Option<SettingsEditState>,
+    show_rename: bool,
+    rename_text: String,
+    jobs: Vec<(String, Value)>,
 }
 
 impl App {
@@ -113,6 +125,10 @@ impl App {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|millis| std::time::Instant::now() + std::time::Duration::from_millis(millis)),
+            settings_edit: None,
+            show_rename: false,
+            rename_text: String::new(),
+            jobs: Vec::new(),
         };
         app.connect();
         app
@@ -445,6 +461,20 @@ impl App {
             "question/resolved" => {
                 self.questions.retain(|pending| pending.rpc_id != frame.rpc_id);
             }
+            "session/jobs" => {
+                let session_id = frame.payload.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+                if self.selected.as_deref() != Some(session_id) {
+                    return;
+                }
+                let jobs = frame.payload.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+                self.jobs = jobs
+                    .iter()
+                    .map(|job| {
+                        let id = job.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
+                        (id, job.clone())
+                    })
+                    .collect();
+            }
             "session/projection" => {
                 let session_id = frame.payload.get("sessionId").and_then(Value::as_str).unwrap_or_default();
                 if self.selected.as_deref() != Some(session_id) {
@@ -525,7 +555,12 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         Panel::left("sessions").resizable(true).default_size(250.0).show(ui, |ui| {
             ui.add_space(4.0);
-            ui.heading("会话");
+            ui.horizontal(|ui| {
+                ui.heading("会话");
+                if ui.small_button("刷新").clicked() {
+                    self.refresh_sessions();
+                }
+            });
             ui.separator();
             let mut open_id: Option<String> = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -687,8 +722,37 @@ impl App {
             }
 
             ui.separator();
-            if ui.button("归档会话").clicked() {
-                self.archive_selected();
+            ui.horizontal(|ui| {
+                if ui.button("重命名").clicked() {
+                    self.show_rename = true;
+                    self.rename_text = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == session_id)
+                        .map(|session| session.display_name().to_string())
+                        .unwrap_or_default();
+                }
+                if ui.button("归档会话").clicked() {
+                    self.archive_selected();
+                }
+            });
+
+            ui.separator();
+            ui.label("后台任务");
+            if self.jobs.is_empty() {
+                ui.label("无");
+            } else {
+                for (id, job) in &self.jobs {
+                    let kind = job.get("kind").and_then(Value::as_str).unwrap_or("?");
+                    let label = job.get("label").and_then(Value::as_str).unwrap_or("-");
+                    egui::CollapsingHeader::new(format!("{kind} · {label}"))
+                        .id_salt(("job", id))
+                        .show(ui, |ui| {
+                            if let Some(detail) = job.get("detail").and_then(Value::as_str) {
+                                ui.add(egui::Label::new(detail).wrap());
+                            }
+                        });
+                }
             }
 
             if apply_model {
@@ -894,14 +958,49 @@ impl App {
 }
 
 impl App {
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_rename {
+            return;
+        }
+        let mut open = self.show_rename;
+        let mut confirm = false;
+        egui::Window::new("重命名会话")
+            .id(egui::Id::new("rename_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.text_edit_singleline(&mut self.rename_text);
+                if ui.button("确认").clicked() {
+                    confirm = true;
+                }
+            });
+        self.show_rename = open;
+        if confirm {
+            if let (Some(backend), Some(session_id)) = (self.backend(), self.selected.clone()) {
+                let title = self.rename_text.trim().to_string();
+                if !title.is_empty() {
+                    match backend.call("session.rename", serde_json::json!({ "sessionId": session_id, "title": title })) {
+                        Ok(_) => self.refresh_sessions(),
+                        Err(error) => self.status = format!("重命名失败：{error}"),
+                    }
+                }
+            }
+            self.show_rename = false;
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
         }
         let mut open = self.show_settings;
-        egui::Window::new("设置（只读视图）")
+        let mut start_edit: Option<(String, u64, Value)> = None;
+        let mut save_edit: Option<(String, u64, Vec<dsh_remote::domains::PathOp>)> = None;
+        let mut cancel_edit = false;
+        egui::Window::new("设置")
             .id(egui::Id::new("settings_window"))
-            .default_width(520.0)
+            .default_width(560.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 if self.settings_cache.is_none() {
@@ -913,28 +1012,103 @@ impl App {
                 }
                 if ui.button("刷新").clicked() {
                     self.settings_cache = None;
+                    self.settings_edit = None;
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let namespaces = self.settings_cache.clone().unwrap_or_default();
                     for namespace in namespaces {
-                        egui::CollapsingHeader::new(format!(
-                            "{} · applies={} · revision={}",
-                            namespace.ns, namespace.applies, namespace.revision
-                        ))
-                        .id_salt(("ns", &namespace.ns))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    serde_json::to_string_pretty(&namespace.value).unwrap_or_default(),
-                                )
-                                .wrap(),
+                        let editing = self
+                            .settings_edit
+                            .as_ref()
+                            .is_some_and(|state| state.ns == namespace.ns);
+                        if editing {
+                            ui.collapsing(
+                                format!(
+                                    "✏️ {} · applies={} · revision={}",
+                                    namespace.ns, namespace.applies, namespace.revision
+                                ),
+                                |ui| {
+                                    self.render_settings_form(ui, &namespace, &mut save_edit);
+                                    if ui.button("取消").clicked() {
+                                        cancel_edit = true;
+                                    }
+                                },
                             );
-                        });
+                        } else {
+                            egui::CollapsingHeader::new(format!(
+                                "{} · applies={} · revision={}",
+                                namespace.ns, namespace.applies, namespace.revision
+                            ))
+                            .id_salt(("ns", &namespace.ns))
+                            .show(ui, |ui| {
+                                if namespace.schema.get("refs").is_some() && ui.button("编辑").clicked() {
+                                    start_edit = Some((
+                                        namespace.ns.clone(),
+                                        namespace.revision,
+                                        namespace.value.clone(),
+                                    ));
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        serde_json::to_string_pretty(&namespace.value).unwrap_or_default(),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
                     }
                 });
             });
         self.show_settings = open;
+        if let Some((ns, revision, value)) = start_edit {
+            self.settings_edit = Some(SettingsEditState { ns, revision, edited: value });
+        }
+        if cancel_edit {
+            self.settings_edit = None;
+        }
+        if let Some((ns, revision, ops)) = save_edit {
+            self.save_settings_edit(&ns, revision, &ops);
+        }
+    }
+
+    /// Render one namespace's schema-driven form into its edit state.
+    fn render_settings_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        namespace: &dsh_remote::domains::SettingsNamespaceView,
+        save_edit: &mut Option<(String, u64, Vec<dsh_remote::domains::PathOp>)>,
+    ) {
+        let Some(refs) = namespace.schema.get("refs").and_then(Value::as_object) else {
+            ui.label("该命名空间没有可渲染的 schema");
+            return;
+        };
+        let Some(root_uid) = namespace.schema.get("uid").and_then(Value::as_u64) else {
+            ui.label("schema 缺少根节点");
+            return;
+        };
+        let Some(root) = refs.get(&root_uid.to_string()) else {
+            ui.label("schema 根节点缺失");
+            return;
+        };
+        let Some(state) = self.settings_edit.as_mut() else { return };
+        let mut ops: Vec<dsh_remote::domains::PathOp> = Vec::new();
+        render_schema_node(ui, refs, root, &mut state.edited, &[], &mut ops);
+        if ui.button("保存").clicked() && !ops.is_empty() {
+            *save_edit = Some((state.ns.clone(), state.revision, ops));
+        }
+    }
+
+    fn save_settings_edit(&mut self, ns: &str, revision: u64, ops: &[dsh_remote::domains::PathOp]) {
+        let Some(backend) = self.backend() else { return };
+        match backend.client().mutate_settings(ns, ops, Some(revision)) {
+            Ok(_) => {
+                self.settings_edit = None;
+                self.settings_cache = None;
+                self.status = format!("{ns} 已保存");
+            }
+            Err(error) => self.status = format!("保存 {ns} 失败：{error}"),
+        }
     }
 
     fn goal_dialog(&mut self, ctx: &egui::Context) {
@@ -984,6 +1158,7 @@ impl eframe::App for App {
         }
         self.drain(&ctx);
         self.modals(&ctx);
+        self.rename_dialog(&ctx);
         self.settings_window(&ctx);
         self.goal_dialog(&ctx);
         self.status_bar(ui);
@@ -1013,6 +1188,126 @@ fn sidecar_argv() -> Option<Vec<String>> {
         return if argv.is_empty() { None } else { Some(argv) };
     }
     Some(vec!["dsh".to_string(), "web".to_string()])
+}
+
+/// Recursive schema-driven form renderer: walks the schemastery `refs`
+/// graph, edits `value` in place, and records every change as a
+/// path-addressed settings op (diffed saves preserve untouched fields and
+/// redacted secrets).
+fn render_schema_node(
+    ui: &mut egui::Ui,
+    refs: &serde_json::Map<String, Value>,
+    node: &Value,
+    value: &mut Value,
+    path: &[String],
+    ops: &mut Vec<PathOp>,
+) {
+    let node_type = node.get("type").and_then(Value::as_str).unwrap_or("");
+    match node_type {
+        "object" => {
+            let Some(dict) = node.get("dict").and_then(Value::as_object).cloned() else {
+                ui.label("(对象)");
+                return;
+            };
+            for (key, uid_ref) in &dict {
+                let Some(uid) = uid_ref.as_u64() else { continue };
+                let Some(child) = refs.get(&uid.to_string()) else { continue };
+                if value.get(key).is_none() {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(key.clone(), Value::Null);
+                    }
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(key.clone());
+                ui.label(key);
+                ui.indent(key, |ui| {
+                    if let Some(child_value) = value.get_mut(key) {
+                        render_schema_node(ui, refs, child, child_value, &child_path, ops);
+                    }
+                });
+            }
+        }
+        "string" => {
+            let mut text = value.as_str().unwrap_or("").to_string();
+            if ui.text_edit_singleline(&mut text).changed() {
+                *value = Value::String(text.clone());
+                ops.push(PathOp::Set { path: path.to_vec(), value: Value::String(text) });
+            }
+        }
+        "number" => {
+            let mut number = value.as_f64().unwrap_or(0.0);
+            let meta = node.get("meta");
+            let min = meta.and_then(|m| m.get("min")).and_then(Value::as_f64).unwrap_or(f64::MIN);
+            let max = meta.and_then(|m| m.get("max")).and_then(Value::as_f64).unwrap_or(f64::MAX);
+            let step = meta.and_then(|m| m.get("step")).and_then(Value::as_f64).unwrap_or(1.0);
+            if ui.add(egui::DragValue::new(&mut number).range(min..=max).speed(step)).changed() {
+                if let Some(json_number) = serde_json::Number::from_f64(number) {
+                    *value = Value::Number(json_number);
+                    ops.push(PathOp::Set { path: path.to_vec(), value: value.clone() });
+                }
+            }
+        }
+        "boolean" => {
+            let mut flag = value.as_bool().unwrap_or(false);
+            if ui.checkbox(&mut flag, "").changed() {
+                *value = Value::Bool(flag);
+                ops.push(PathOp::Set { path: path.to_vec(), value: Value::Bool(flag) });
+            }
+        }
+        "union" => {
+            let list = node.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
+            let is_const_union = !list.is_empty()
+                && list.iter().all(|uid| {
+                    uid.as_u64()
+                        .and_then(|u| refs.get(&u.to_string()))
+                        .map(|n| n.get("type").and_then(Value::as_str) == Some("const"))
+                        .unwrap_or(false)
+                });
+            if is_const_union {
+                let options: Vec<String> = list
+                    .iter()
+                    .filter_map(|uid| {
+                        let n = refs.get(&uid.as_u64()?.to_string())?;
+                        n.get("value").and_then(Value::as_str).map(str::to_string)
+                    })
+                    .collect();
+                let current = value.as_str().unwrap_or("").to_string();
+                let mut selected = if options.contains(&current) {
+                    current.clone()
+                } else {
+                    options[0].clone()
+                };
+                egui::ComboBox::from_id_salt(("union", path.join(".")))
+                    .selected_text(selected.as_str())
+                    .show_ui(ui, |ui| {
+                        for option in &options {
+                            ui.selectable_value(&mut selected, option.clone(), option);
+                        }
+                    });
+                if selected != current {
+                    *value = Value::String(selected.clone());
+                    ops.push(PathOp::Set { path: path.to_vec(), value: Value::String(selected) });
+                }
+            } else {
+                ui.label(format!("（复合类型，只读）{}", truncate(&value.to_string(), 80)));
+            }
+        }
+        "array" => {
+            let mut text = serde_json::to_string(value).unwrap_or_else(|_| "[]".to_string());
+            if ui.text_edit_singleline(&mut text).changed() {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                    *value = parsed.clone();
+                    ops.push(PathOp::Set { path: path.to_vec(), value: parsed });
+                }
+            }
+        }
+        "const" => {
+            ui.label(value.to_string());
+        }
+        _ => {
+            ui.label(format!("（{node_type} 类型，只读）{}", truncate(&value.to_string(), 80)));
+        }
+    }
 }
 
 fn short_id(id: &str) -> String {
