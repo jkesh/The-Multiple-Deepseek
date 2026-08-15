@@ -83,33 +83,37 @@ npx vitest run tests/team-settings.spec.ts
 
 `build.mjs` bundles the host and client halves; client CSS modules are inlined at build time. The package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`), where the full test suite also runs.
 
-## Tauri desktop client
+## Native desktop client
 
-The repository ships a Tauri 2 desktop shell in `desktop/`. It connects to the local
-`http://127.0.0.1:3080` DSH web runtime and starts the installed `dsh web` command
-when the port is not listening (the child console window is hidden). The shell owns the
-backend lifecycle: a floating panel in the GUI shows the `/api/health` heartbeat status
-with start/stop buttons, stopping prefers the graceful `POST /api/shutdown`, and
-closing the window shuts the backend down (graceful first, then process-tree cleanup).
+The repository ships a native Rust desktop client in `native/` (egui, no
+webview, no served WebUI — see [docs/native-client.md](docs/native-client.md)).
+It talks to the local dsh backend over the pinned protocol and owns the
+backend lifecycle: heartbeat (`/api/health` with boot-marker fallback),
+spawns `dsh web` on demand, start/stop buttons, and stop-with-the-window on
+close (graceful `/api/shutdown` or process-tree cleanup).
 
 ```sh
-npm run desktop:dev
-npm run desktop:build
+cargo run -p dsh-client            # dev run
+cargo build --release -p dsh-client  # release exe
+makensis installer/installer.nsi   # NSIS installer (from native/)
 ```
 
-`desktop:build` produces the release executable at
-`desktop/src-tauri/target/release/tmd-desktop.exe` and an NSIS installer at
-`desktop/src-tauri/target/release/bundle/nsis/DeepSeek Harness Team_0.1.0_x64-setup.exe`.
-Building requires Rust/MSVC, WebView2, Node.js, and a `dsh` command on PATH. The
-current MVP reuses the installed DSH runtime; the signed side-by-side runtime,
-atomic update, and rollback design lives in `docs/update-architecture.md`.
+The release executable lands at `native/target/release/dsh-client.exe` and
+the installer at `native/target/release/dsh-client-setup.exe`. Building
+requires Rust/MSVC and a `dsh` command on PATH (the client starts the
+backend itself when it is not running).
+
+### Deprecated: Tauri shell
+
+`desktop/` is the legacy Tauri 2 wrapper around the served WebUI; it is kept
+for reference only and no longer built by CI. The native client replaces it.
 
 ## CI and releases
 
 `.github/workflows/build.yml` runs on pushes to `main`, pull requests, `v*` tags, and manual dispatch:
 
 - builds and tests the plugin on Ubuntu;
-- builds the Tauri exe and NSIS installer on Windows and uploads them as run artifacts;
+- builds the native Rust client and its NSIS installer on Windows and uploads them as run artifacts;
 - on a `v*` tag, publishes a GitHub Release with the exe, installer, and SHA256.
 
 To cut a release:

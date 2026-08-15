@@ -40,14 +40,10 @@ jobs:
           if-no-files-found: error
 
   desktop:
-    name: Desktop build (Tauri / NSIS)
+    name: Desktop build (native Rust / NSIS)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -57,36 +53,44 @@ jobs:
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: desktop/src-tauri -> target
+          workspaces: native -> target
 
-      - name: Install desktop dependencies
-        working-directory: desktop
-        run: npm ci
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
 
-      - name: Build desktop app and NSIS installer
-        run: npm run desktop:build
+      - name: Build native client (release)
+        working-directory: native
+        run: cargo build --release -p dsh-client
 
-      - name: Generate installer checksum
+      - name: Build NSIS installer
+        working-directory: native
         shell: pwsh
         run: |
-          $installer = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
-          if (-not $installer) { throw 'NSIS installer not found' }
-          (Get-FileHash $installer.FullName -Algorithm SHA256).Hash | Set-Content desktop/src-tauri/target/release/bundle/nsis/SHA256SUMS.txt -Encoding ascii
+          $makensis = Get-ChildItem "C:\Program Files (x86)\NSIS\makensis.exe" -ErrorAction Stop
+          & $makensis.FullName installer\installer.nsi
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $sums = @()
+          $sums += (Get-FileHash native\target\release\dsh-client.exe -Algorithm SHA256).Hash + "  dsh-client.exe"
+          $sums += (Get-FileHash native\target\release\dsh-client-setup.exe -Algorithm SHA256).Hash + "  dsh-client-setup.exe"
+          $sums | Set-Content native\target\release\SHA256SUMS.txt -Encoding ascii
 
       - name: Upload desktop executable
         uses: actions/upload-artifact@v4
         with:
-          name: tmd-desktop-exe
-          path: desktop/src-tauri/target/release/tmd-desktop.exe
+          name: dsh-client-exe
+          path: native/target/release/dsh-client.exe
           if-no-files-found: error
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
-          name: tmd-desktop-installer
+          name: dsh-client-installer
           path: |
-            desktop/src-tauri/target/release/bundle/nsis/*.exe
-            desktop/src-tauri/target/release/bundle/nsis/SHA256SUMS.txt
+            native/target/release/dsh-client-setup.exe
+            native/target/release/SHA256SUMS.txt
           if-no-files-found: error
 
   release:
@@ -100,13 +104,13 @@ jobs:
       - name: Download installer artifact
         uses: actions/download-artifact@v4
         with:
-          name: tmd-desktop-installer
+          name: dsh-client-installer
           path: artifacts/installer
 
       - name: Download executable artifact
         uses: actions/download-artifact@v4
         with:
-          name: tmd-desktop-exe
+          name: dsh-client-exe
           path: artifacts/exe
 
       - name: Publish release assets

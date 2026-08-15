@@ -1,4 +1,7 @@
-# DSH Tauri desktop client
+# DSH Tauri desktop client — DEPRECATED
+
+> Replaced by the native Rust client in `../native` (egui, no webview, no
+> served WebUI). Kept for reference only; CI no longer builds this shell.
 
 This Tauri 2 shell is the separated desktop client for the local DeepSeek
 Harness web runtime at http://127.0.0.1:3080. It owns the backend lifecycle:
