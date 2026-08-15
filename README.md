@@ -73,6 +73,24 @@ The plugin also ships a **roster configuration panel**: after a restart, open шо
 
 This package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`). `src/` is the source of truth; `lib/` is a committed build so git-based installs need no prepare script. To rebuild, check out the monorepo and run its `pnpm run build`; the tests (`tests/`) run inside the monorepo with `pnpm exec vitest run packages/team/multiple-deepseek/tests`.
 
+## Tauri desktop client
+
+The repository ships a Tauri 2 desktop shell in `desktop/`. It connects to the local
+`http://127.0.0.1:3080` DSH web runtime and starts the installed `dsh web` command
+when the port is not listening (the child console window is hidden).
+
+```sh
+npm run desktop:dev
+npm run desktop:build
+```
+
+`desktop:build` produces the release executable at
+`desktop/src-tauri/target/release/tmd-desktop.exe` and an NSIS installer at
+`desktop/src-tauri/target/release/bundle/nsis/DeepSeek Harness Team_0.1.0_x64-setup.exe`.
+Building requires Rust/MSVC, WebView2, Node.js, and a `dsh` command on PATH. The
+current MVP reuses the installed DSH runtime; the signed side-by-side runtime,
+atomic update, and rollback design lives in `docs/update-architecture.md`.
+
 ## License
 
 MIT

@@ -73,6 +73,24 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 
 本包源自 deepseek-harness 单仓中的 `@deepseek-ai/dsh-multiple-deepseek`（`packages/team/multiple-deepseek`）。`src/` 是事实来源；`lib/` 是已提交的构建产物，因此基于 git 的安装无需 prepare 脚本。重新构建请检出单仓并运行其 `pnpm run build`；测试（`tests/`）在单仓内用 `pnpm exec vitest run packages/team/multiple-deepseek/tests` 运行。
 
+## Tauri 桌面客户端
+
+仓库包含一个位于 `desktop/` 的 Tauri 2 桌面壳。它连接本机
+`http://127.0.0.1:3080`，未检测到服务时会启动系统中的 `dsh web`
+（子进程命令行窗口已隐藏）。
+
+```sh
+npm run desktop:dev
+npm run desktop:build
+```
+
+`desktop:build` 会生成 release 可执行文件
+`desktop/src-tauri/target/release/tmd-desktop.exe` 和 NSIS 安装包
+`desktop/src-tauri/target/release/bundle/nsis/DeepSeek Harness Team_0.1.0_x64-setup.exe`。
+构建需要 Rust/MSVC、WebView2、Node.js，以及 PATH 中可用的 `dsh` 命令。
+当前 MVP 复用本机 DSH 运行时；签名运行时、原子更新和回滚方案见
+`docs/update-architecture.md`。
+
 ## License
 
 MIT

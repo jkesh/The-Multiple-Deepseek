@@ -1,3 +1,6 @@
 node_modules/
 *.tsbuildinfo
 *.log
+desktop/src-tauri/target/
+desktop/src-tauri/gen/schemas/
+desktop/node_modules/
