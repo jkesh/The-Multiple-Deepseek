@@ -1,5 +1,5 @@
 [workspace]
-members = ["dsh-remote"]
+members = ["dsh-remote", "dsh-client"]
 resolver = "2"
 
 [workspace.package]

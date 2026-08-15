@@ -21,21 +21,15 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
-    /// Sidebar-facing display title (dsh does not ship a dedicated title field).
+    /// Sidebar-facing display title: the session title projection, else the
+    /// stable id prefix.
     pub fn display_name(&self) -> &str {
-        // The title projection lives under projections.values.sessionListMetadata/title
-        // in some deployments; fall back to a stable id prefix otherwise.
-        self.projection_string("title")
-            .unwrap_or(self.session_id.as_str())
-    }
-
-    fn projection_string(&self, key: &str) -> Option<&str> {
         self.projections
-            .as_ref()?
-            .get("values")?
-            .get("sessionListMetadata")?
-            .get(key)?
-            .as_str()
+            .as_ref()
+            .and_then(|p| p.get("values"))
+            .and_then(|v| v.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| &self.session_id)
     }
 }
 

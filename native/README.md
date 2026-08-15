@@ -17,6 +17,11 @@ architecture decision and the pinned wire contract.
     model catalog + reasoning efforts + `session.selectModel`,
     agent presets, goals (create/edit/pause/resume/complete/clear),
     workspaces/archive, approvals & questions via `/api/respond`.
+- `dsh-client` — native egui desktop application: session sidebar with
+  running dots, streaming markdown transcript (CJK fonts loaded from the
+  system), multiline composer, model/preset pickers with reasoning effort,
+  approval and ask-user question modals, background worker thread for RPC
+  and the WebSocket downlink.
 - `dsh-smoke` (bin) — read-only transport probe.
 - `dsh-chat` (bin) — conversation CLI: `new`, `continue`, `history`,
   `list`, `rename`, `settings`, `models`, `presets`, `workspaces`,
@@ -25,10 +30,9 @@ architecture decision and the pinned wire contract.
 ## Run
 
 ```sh
+cargo run -p dsh-client
 cargo run -p dsh-remote --bin dsh-smoke
 cargo run -p dsh-remote --bin dsh-chat -- new "你好"
-cargo run -p dsh-remote --bin dsh-chat -- continue <sessionId> "继续"
-cargo run -p dsh-remote --bin dsh-chat -- history <sessionId>
 ```
 
 Requires a running `dsh web` on 127.0.0.1:3080 (override with

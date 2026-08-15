@@ -208,12 +208,30 @@ pub struct ModelSelection {
     pub reasoning_effort: Option<String>,
 }
 
+/// `session.models` value: the session's current route plus the catalog
+/// it was routed from.
+#[derive(Deserialize, Debug, Clone)]
+pub struct SessionModels {
+    pub current: ModelSelection,
+    pub routable: bool,
+    pub groups: Vec<ModelProviderGroup>,
+    pub failures: Vec<ModelCatalogFailure>,
+}
+
 impl DshClient {
     /// Configurable provider routes.
     pub fn llm_providers(&self) -> Result<Vec<ConfigurableProviderView>, RemoteError> {
         let value = self.call_empty("llm.providers")?;
         serde_json::from_value(value)
             .map_err(|error| RemoteError::Json(format!("llm.providers value: {error}")))
+    }
+
+    /// One session's current route and routable catalog.
+    pub fn session_models(&self, session_id: &str) -> Result<SessionModels, RemoteError> {
+        let payload = serde_json::json!({ "sessionId": session_id });
+        let value = self.call("session.models", payload)?;
+        serde_json::from_value(value)
+            .map_err(|error| RemoteError::Json(format!("session.models value: {error}")))
     }
 
     /// The model catalog grouped by provider.
