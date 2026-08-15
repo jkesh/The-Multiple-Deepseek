@@ -87,7 +87,10 @@ npx vitest run tests/team-settings.spec.ts
 
 The repository ships a Tauri 2 desktop shell in `desktop/`. It connects to the local
 `http://127.0.0.1:3080` DSH web runtime and starts the installed `dsh web` command
-when the port is not listening (the child console window is hidden).
+when the port is not listening (the child console window is hidden). The shell owns the
+backend lifecycle: a floating panel in the GUI shows the `/api/health` heartbeat status
+with start/stop buttons, stopping prefers the graceful `POST /api/shutdown`, and
+closing the window shuts the backend down (graceful first, then process-tree cleanup).
 
 ```sh
 npm run desktop:dev
