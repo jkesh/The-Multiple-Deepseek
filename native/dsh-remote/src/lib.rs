@@ -11,6 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod chat;
+pub mod model;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
