@@ -67,11 +67,20 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 
 想一键切换**团队模式**：把 `preset/team-mode` 目录复制到 `~\.dsh\.agent-presets\team-mode`（dsh 实时发现，无需重启），然后在会话的预设选择器里选 团队模式——它会换用团队主管 persona，让模型默认通过 `deepseek_team` 编排；`/team` 命令仍然可用，用于直接触发。
 
-插件还附带**花名册配置面板**：重启后在 GUI 打开 设置 → 团队模式，即可编辑每个角色的模型、LLM 路由与人设——通过设置文档保存，下一次团队任务即按新路由生效（由 `multiple-deepseek` 设置区段支撑）。
+插件还附带**花名册配置面板**：重启后在 GUI 打开 设置 → 团队模式。面板使用 DSH 风格的角色下拉与默认 LLM 路由下拉（路由来自宿主机 `llm.providers` 中已启用的提供方），支持逐角色编辑模型、路由与人设，并通过 `multiple-deepseek` 设置区段保存/恢复——下一次团队任务即按新路由生效。
 
 ## 开发
 
-本包源自 deepseek-harness 单仓中的 `@deepseek-ai/dsh-multiple-deepseek`（`packages/team/multiple-deepseek`）。`src/` 是事实来源；`lib/` 是已提交的构建产物，因此基于 git 的安装无需 prepare 脚本。重新构建请检出单仓并运行其 `pnpm run build`；测试（`tests/`）在单仓内用 `pnpm exec vitest run packages/team/multiple-deepseek/tests` 运行。
+`src/` 是事实来源；`lib/` 是已提交的构建产物，因此基于 git 的安装无需 prepare 脚本。本仓库可独立构建：
+
+```sh
+npm install --no-save --ignore-scripts --legacy-peer-deps esbuild@^0.28.2
+npm run build
+npm install --no-save --ignore-scripts --legacy-peer-deps vitest@^3
+npx vitest run tests/team-settings.spec.ts
+```
+
+`build.mjs` 负责打包宿主半与浏览器半，客户端 CSS module 在构建时内联。本包源自 deepseek-harness 单仓中的 `@deepseek-ai/dsh-multiple-deepseek`（`packages/team/multiple-deepseek`），完整测试套件亦可在单仓内运行。
 
 ## Tauri 桌面客户端
 
@@ -90,6 +99,21 @@ npm run desktop:build
 构建需要 Rust/MSVC、WebView2、Node.js，以及 PATH 中可用的 `dsh` 命令。
 当前 MVP 复用本机 DSH 运行时；签名运行时、原子更新和回滚方案见
 `docs/update-architecture.md`。
+
+## CI 与发布
+
+`.github/workflows/build.yml` 在推送到 `main`、Pull Request、`v*` 标签与手动触发时运行：
+
+- 在 Ubuntu 上构建并测试插件；
+- 在 Windows 上构建 Tauri exe 与 NSIS 安装包，并作为 run artifact 上传；
+- 当推送 `v*` 标签时，自动创建 GitHub Release 并附带 exe、安装包与 SHA256。
+
+发布一个版本：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## License
 

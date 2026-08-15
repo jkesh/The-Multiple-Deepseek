@@ -67,11 +67,20 @@ Segments split on `|` or newlines; each is `role: task` or a bare task routed to
 
 For a switchable **team mode**, copy the `preset/team-mode` directory to `~\.dsh\.agent-presets\team-mode` (dsh discovers it live), then pick 团队模式 in the session's preset selector: it swaps the lead persona so the model orchestrates through `deepseek_team` by default, while the `/team` command stays available for direct runs.
 
-The plugin also ships a **roster configuration panel**: after a restart, open 设置 → 团队模式 in the GUI to edit each role's model, LLM route, and persona — saved through the settings document and hot-routed on the next team task (the `multiple-deepseek` settings section backs it).
+The plugin also ships a **roster configuration panel**: after a restart, open 设置 → 团队模式 in the GUI. The panel provides a DSH-style role dropdown, a default LLM route dropdown populated from the host's active `llm.providers`, per-role model/route/persona editing, and save/reset through the `multiple-deepseek` settings document — changes hot-route the next team task.
 
 ## Development
 
-This package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`). `src/` is the source of truth; `lib/` is a committed build so git-based installs need no prepare script. To rebuild, check out the monorepo and run its `pnpm run build`; the tests (`tests/`) run inside the monorepo with `pnpm exec vitest run packages/team/multiple-deepseek/tests`.
+`src/` is the source of truth; `lib/` is a committed build so git-based installs need no prepare script. This repository builds standalone:
+
+```sh
+npm install --no-save --ignore-scripts --legacy-peer-deps esbuild@^0.28.2
+npm run build
+npm install --no-save --ignore-scripts --legacy-peer-deps vitest@^3
+npx vitest run tests/team-settings.spec.ts
+```
+
+`build.mjs` bundles the host and client halves; client CSS modules are inlined at build time. The package originates from the deepseek-harness monorepo package `@deepseek-ai/dsh-multiple-deepseek` (`packages/team/multiple-deepseek`), where the full test suite also runs.
 
 ## Tauri desktop client
 
@@ -90,6 +99,21 @@ npm run desktop:build
 Building requires Rust/MSVC, WebView2, Node.js, and a `dsh` command on PATH. The
 current MVP reuses the installed DSH runtime; the signed side-by-side runtime,
 atomic update, and rollback design lives in `docs/update-architecture.md`.
+
+## CI and releases
+
+`.github/workflows/build.yml` runs on pushes to `main`, pull requests, `v*` tags, and manual dispatch:
+
+- builds and tests the plugin on Ubuntu;
+- builds the Tauri exe and NSIS installer on Windows and uploads them as run artifacts;
+- on a `v*` tag, publishes a GitHub Release with the exe, installer, and SHA256.
+
+To cut a release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## License
 
