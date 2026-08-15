@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod chat;
+pub mod domains;
 pub mod model;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -443,10 +444,7 @@ impl WsDownlink {
 
     /// Next frame; `None` when the downlink closed cleanly.
     pub fn next(&self) -> Option<Result<Frame, RemoteError>> {
-        match self.rx.recv() {
-            Ok(frame) => Some(frame),
-            Err(_) => None,
-        }
+        self.rx.recv().ok()
     }
 
     /// Next frame with a timeout; `None` on timeout or clean close.
