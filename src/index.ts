@@ -23,7 +23,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
-import type { AgentOptions } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
@@ -67,6 +67,10 @@ export const DEFAULT_TOOL_NAME = 'deepseek_team'
 export const DEFAULT_MAX_TASKS = 8
 /** Default cap on concurrently running team tasks. */
 export const DEFAULT_MAX_PARALLEL = 6
+/** Shell tools that make team members able to inspect and run work on the host. */
+const WORK_SHELL_TOOLS = ['bash', 'pwsh'] as const
+/** Filesystem tools that make team members able to read, search, and edit work. */
+const WORK_FS_TOOLS = ['read', 'write', 'edit', 'glob', 'grep'] as const
 /** Prompt order after the subagent delegation guidance. */
 const TEAM_SECTION_ORDER = 117
 
@@ -129,6 +133,8 @@ export interface Config {
   maxParallel?: number
   /** Expose `run_in_background` (default true). Disabled instances omit the parameter and reject forced background calls. */
   enableRunInBackground?: boolean
+  /** Refuse a team call when the calling session exposes no file/shell work tools (default true). */
+  requireWorkTools?: boolean
   /** Tool filter applied to every child. Requires the provider's `toolFilter` capability; unknown names fail startup. */
   toolFilter?: {
     /** Global tool names the child keeps; everything else is removed. */
@@ -173,6 +179,7 @@ export const Config: z<Config> = z.object({
   maxTasks: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TASKS),
   maxParallel: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_PARALLEL),
   enableRunInBackground: z.boolean().default(true),
+  requireWorkTools: z.boolean().default(true),
   // Prevent Schemastery from materializing omitted toolFilter as `{ allow: [] }`, which would deny every tool.
   toolFilter: z.object({
     allow: z.array(z.string()).default(undefined as unknown as string[]),
@@ -608,6 +615,18 @@ function summarizeTeam(tasks: readonly TeamTaskOutcome[]): JobOutcome {
   return { status: 'failed', detail: `${incomplete} of ${tasks.length} DeepSeek team tasks did not complete` }
 }
 
+/**
+ * The workbench tools a team member would inherit from the calling agent.
+ * In-process children join the parent's agent-preset composition, so this is
+ * exactly what every specialist will see.
+ */
+function workToolCoverage(ctx: Context, parent: Agent): { shell: string[]; fs: string[] } {
+  return {
+    shell: WORK_SHELL_TOOLS.filter(name => ctx.tools.get(name, parent) !== undefined),
+    fs: WORK_FS_TOOLS.filter(name => ctx.tools.get(name, parent) !== undefined),
+  }
+}
+
 /** Mount the team tool on the configured subagent provider. */
 export function apply(ctx: Context, config: Config): void {
   const toolName = config.toolName ?? DEFAULT_TOOL_NAME
@@ -712,7 +731,10 @@ export function apply(ctx: Context, config: Config): void {
       description: 'Coordinate a team of multiple DeepSeek specialists. Each task names a specialist role, '
         + 'and the role selects its DeepSeek model and specialist instructions automatically — name the kind '
         + 'of work, never a model. Tasks run in parallel; this call waits for every member and returns one '
-        + 'result per task. A delegation-depth limit prevents runaway nested teams: if the calling agent '
+        + 'result per task. Members inherit this session\'s tool set, so a team that must read, edit, or run '
+        + 'code requires a session with file and shell tools; the call refuses upfront when none are visible '
+        + '(set `requireWorkTools: false` for tool-free parallel reasoning). '
+        + 'A delegation-depth limit prevents runaway nested teams: if the calling agent '
         + 'is already at or above the configured maxDepth, the call is rejected before any member starts.'
         + (backgroundEnabled
           ? ' Set `run_in_background: true` to run the whole team as a background job and collect it with `job_output`.'
@@ -817,6 +839,23 @@ export function apply(ctx: Context, config: Config): void {
         // execution-time enforcement.
         if (args.run_in_background === true && !backgroundEnabled) {
           throw new Error('run_in_background is disabled for this tool instance (enableRunInBackground: false)')
+        }
+        // Team members inherit the calling session's tool set. Spawning a team
+        // whose members can neither read nor run anything produces exactly the
+        // "no file/shell tools" failure explorers report — fail here with the
+        // actionable fix instead of after every member has already burned a turn.
+        if (config.requireWorkTools !== false) {
+          const coverage = workToolCoverage(ctx, parent)
+          if (coverage.shell.length === 0 && coverage.fs.length === 0) {
+            throw new Error(
+              'deepseek_team: team members inherit the calling session\'s tools, and this session exposes no file or '
+              + 'shell workbench '
+              + `(shell tools visible: ${coverage.shell.join(', ') || 'none'}; file tools visible: ${coverage.fs.join(', ') || 'none'}). `
+              + 'Switch this session to a preset that mounts file/shell tools (the shipped team-mode preset mounts '
+              + 'pwsh/bash, read/write/edit, and glob/grep), or set `requireWorkTools: false` to allow tool-free '
+              + 'parallel reasoning.',
+            )
+          }
         }
         // Preflight depth guard: if the parent already sits at or above the
         // absolute child-depth cap, every team member would exceed it, so fail

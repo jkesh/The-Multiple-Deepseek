@@ -51,3 +51,18 @@ describe('team settings client manifest', () => {
     expect(packageJson.dsh.client.inject).toEqual(expect.arrayContaining(required))
   })
 })
+
+describe('team-mode preset workbench', () => {
+  it('mounts file and shell tools so team members can act on repositories', async () => {
+    const preset = await readFile(new URL('../preset/team-mode/agent.cordis.yml', import.meta.url), 'utf8')
+    for (const row of [
+      '@deepseek-ai/dsh-tool-pwsh',
+      '@deepseek-ai/dsh-tool-bash',
+      '@deepseek-ai/dsh-tool-fs',
+      '@deepseek-ai/dsh-tool-fs-search',
+      '@deepseek-ai/dsh-tool-jobs',
+    ]) {
+      expect(preset).toContain(row)
+    }
+  })
+})

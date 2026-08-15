@@ -1,12 +1,14 @@
 # 团队模式（Team Mode）agent 预设。
 #
-# 只改变 lead agent 的行为：主管 persona 让模型默认按团队方式工作，
-# 通过 deepseek_team 并行分派专家成员。deepseek_team 工具本身由 profile
-# 层的 the-multiple-deepseek 行提供（本预设不再挂载插件，避免服务重复注册）。
+# 本预设把 lead agent 变成团队主管，并给 lead 及所有 deepseek_team 子成员
+# 一套可用的工作工具（Shell、文件读写/编辑、glob/grep、后台任务、提问、
+# 待办、联网检索）。子代理通过 `composeFrom()` 继承父会话的预设组合，
+# 因此这里挂载什么，团队成员就能用什么。
 #
-# 本预设只包含基本插件：persona 切换、agent 指令、以及最少的交互工具。
-# 高级工具（subagent、workflow、ralph、compaction、goals、skills、plan-mode）
-# 不属于 team-mode 的核心用途，由其他预设或 profile 层提供。
+# deepseek_team 工具本身由 profile 层的 the-multiple-deepseek 行提供
+# （本预设不再挂载插件，避免服务重复注册）。本预设不挂载 subagent/workflow/
+# ralph/compaction 等高级编排工具——团队内部编排由 deepseek_team 完成；
+# 需要时可在本文件追加相应行。
 #
 # 用法：把本目录复制到 ~/.dsh/.agent-presets/team-mode/（dsh 会实时发现，
 # 无需重启），然后在会话的预设选择器或 settings.yaml 中选用。
@@ -23,13 +25,50 @@
       reviewer — adversarial review; explorer — codebase research; quick — small fast edits. Batch
       independent tasks into one call, wait for every member, aggregate their results, and drive the
       objective to completion. Use the /team command yourself when a human asks for a direct team run.
+      Before delegating work that reads, edits, or runs code, confirm this session exposes file and
+      shell tools; if it does not, tell the user to switch to a preset that mounts them instead of
+      launching specialists that cannot act.
 
 - id: agent-instructions
   name: '@deepseek-ai/dsh-agent-instructions'
   config:
     maxBytes: 65536
 
-# ── basic tools the team lead uses ──────────────────────────────────────────
+# ── shell ───────────────────────────────────────────────────────────────────
+#
+# 与 anchored-standard 保持一致：shell 注册表、sandbox 策略与 shell-env 都在
+# host composition 中；这里只挂载面向模型的工具行，并按平台只启用其一。
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+#
+# `fs` 服务与观察/沙箱策略留在 host 层；这两个包只把 read/write/edit 与
+# glob/grep 注册进 tools 注册表。
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+#
+# deepseek_team 的 run_in_background 与 job_output/job_kill 需要任务注册表
+# 与模型面工具；注册表仍在 host 层，这里只暴露模型工具。
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── interaction ────────────────────────────────────────────────────────────
 
 - id: tool-ask-user
   name: '@deepseek-ai/dsh-tool-ask-user'

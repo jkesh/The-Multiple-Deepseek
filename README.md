@@ -50,6 +50,7 @@ The plugin imports `@deepseek-ai/dsh-*` and `@deepseek-ai/cordis` as peer depend
 | `maxTasks` | 8 | Cap on tasks per call. |
 | `maxParallel` | 6 | Cap on concurrently running tasks. |
 | `enableRunInBackground` | true | Expose `run_in_background`. |
+| `requireWorkTools` | true | Refuse a team call when the calling session exposes no file/shell tools; set `false` for tool-free parallel reasoning. |
 | `toolFilter` | none | `{ allow?, deny? }` applied to every child. |
 | `maxDepth` | 3 | Maximum child depth, or `'provider-managed'`. |
 
@@ -65,7 +66,7 @@ When the `ctx.commands` seam is mounted (every dsh-base profile), the plugin reg
 
 Segments split on `|` or newlines; each is `role: task` or a bare task routed to `defaultRole`. An invalid line or an absent provider reports a readable error.
 
-For a switchable **team mode**, copy the `preset/team-mode` directory to `~\.dsh\.agent-presets\team-mode` (dsh discovers it live), then pick 团队模式 in the session's preset selector: it swaps the lead persona so the model orchestrates through `deepseek_team` by default, while the `/team` command stays available for direct runs.
+For a switchable **team mode**, copy the `preset/team-mode` directory to `~\.dsh\.agent-presets\team-mode` (dsh discovers it live), then pick 团队模式 in the session's preset selector: it swaps the lead persona so the model orchestrates through `deepseek_team` by default, while the `/team` command stays available for direct runs. The shipped preset mounts the workbench team members inherit — platform shell (`pwsh`/`bash`), `read`/`write`/`edit`, `glob`/`grep`, background jobs, todo/ask-user, and web search — so specialists can actually read, edit, and run code instead of reporting a missing tool set.
 
 The plugin also ships a **roster configuration panel**: after a restart, open 设置 → 团队模式 in the GUI. The panel provides a DSH-style role dropdown, a default LLM route dropdown populated from the host's active `llm.providers`, per-role model/route/persona editing, and save/reset through the `multiple-deepseek` settings document — changes hot-route the next team task.
 

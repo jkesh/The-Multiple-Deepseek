@@ -50,6 +50,7 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 | `maxTasks` | 8 | 每次调用的任务数上限。 |
 | `maxParallel` | 6 | 并发任务上限。 |
 | `enableRunInBackground` | true | 是否暴露 `run_in_background`。 |
+| `requireWorkTools` | true | 当调用方会话没有任何文件/Shell 工具时拒绝团队调用；设为 `false` 可允许纯推理型并行团队。 |
 | `toolFilter` | 无 | 应用于每个子代理的 `{ allow?, deny? }`。 |
 | `maxDepth` | 3 | 子代理最大深度，或 `'provider-managed'`。 |
 
@@ -65,7 +66,7 @@ pnpm dsh plugin --profile web add github:jkesh/The-Multiple-Deepseek
 
 输入按 `|` 或换行拆段；每段是 `role: 任务`，或直接路由到 `defaultRole` 的裸任务。无效输入或提供方缺失会返回可读错误。
 
-想一键切换**团队模式**：把 `preset/team-mode` 目录复制到 `~\.dsh\.agent-presets\team-mode`（dsh 实时发现，无需重启），然后在会话的预设选择器里选 团队模式——它会换用团队主管 persona，让模型默认通过 `deepseek_team` 编排；`/team` 命令仍然可用，用于直接触发。
+想一键切换**团队模式**：把 `preset/team-mode` 目录复制到 `~\.dsh\.agent-presets\team-mode`（dsh 实时发现，无需重启），然后在会话的预设选择器里选 团队模式——它会换用团队主管 persona，让模型默认通过 `deepseek_team` 编排；`/team` 命令仍然可用，用于直接触发。随仓库发布的预设已经挂载团队成员继承的工作台：平台 Shell（`pwsh`/`bash`）、`read`/`write`/`edit`、`glob`/`grep`、后台任务、todo/ask-user 与联网检索，确保专家子代理能够真正读取、修改和运行代码，而不是回报“没有任何文件/Shell 工具”。
 
 插件还附带**花名册配置面板**：重启后在 GUI 打开 设置 → 团队模式。面板使用 DSH 风格的角色下拉与默认 LLM 路由下拉（路由来自宿主机 `llm.providers` 中已启用的提供方），支持逐角色编辑模型、路由与人设，并通过 `multiple-deepseek` 设置区段保存/恢复——下一次团队任务即按新路由生效。
 
