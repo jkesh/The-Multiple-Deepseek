@@ -47,6 +47,22 @@ pub struct SessionEvent {
     pub source_event_seqs: Option<Vec<u64>>,
     #[serde(default)]
     pub ignorable: Option<bool>,
+    /// Surface marker: `"append"` for transcript-origin events,
+    /// `{op:"replace", …}` for model-only replacement copies.
+    #[serde(default, rename = "surfaceOp")]
+    pub surface_op: Option<Value>,
+}
+
+impl SessionEvent {
+    /// True when this event appended to the model-visible surface tail
+    /// (missing markers on old backends count as append for compatibility).
+    pub fn is_append_surface(&self) -> bool {
+        match (self.typ.as_str(), &self.surface_op) {
+            ("user/message" | "assistant/message" | "tool/result", None) => true,
+            ("user/message" | "assistant/message" | "tool/result", Some(Value::String(op))) => op == "append",
+            _ => false,
+        }
+    }
 }
 
 /// One `session.history` row: the event plus an optional host-computed view.

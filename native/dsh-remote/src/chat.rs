@@ -63,6 +63,26 @@ pub struct Message {
 }
 
 impl Message {
+    /// Producer kind from `source.kind` (`user` / `plugin` / `model` / `tool`).
+    pub fn source_kind(&self) -> &str {
+        self.source.get("kind").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// Context form when the producer declared one (instructions/catalog/...).
+    pub fn source_form(&self) -> Option<String> {
+        self.source.get("form").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// Producing plugin name for context rows.
+    pub fn source_plugin(&self) -> Option<String> {
+        self.source.get("plugin").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// True when the message carries no content (usage-only carriers).
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
     /// Visible text: every `text` block joined in order.
     pub fn text(&self) -> String {
         self.content
@@ -203,11 +223,28 @@ pub struct ToolCallView {
     pub error: Option<Value>,
 }
 
+/// How a transcript row is presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageKind {
+    /// The human's own input.
+    User,
+    /// Injected context (plugin/instructions/snapshot/...): a disclosure row.
+    Context,
+    /// Model output.
+    #[default]
+    Assistant,
+}
+
 /// Assembled per-message state during streaming.
 #[derive(Debug, Clone, Default)]
 pub struct MessageBuffer {
     pub id: String,
     pub role: String,
+    pub kind: MessageKind,
+    /// Producer label for context rows (plugin name or form).
+    pub producer: Option<String>,
+    /// Context form when declared (instructions/catalog/snapshot/notice/relay/recall).
+    pub form: Option<String>,
     /// Visible text blocks by stream index (block-end is authoritative per slot).
     pub text_blocks: BTreeMap<u32, String>,
     pub reasoning_blocks: BTreeMap<u32, String>,
@@ -235,28 +272,47 @@ pub struct Transcript {
     pub messages: Vec<MessageBuffer>,
     pub current_turn: u32,
     pub finished_turns: Vec<u32>,
+    /// (turn, marker) footers: interrupted / max-tokens turns.
+    pub turn_footers: Vec<(u32, String)>,
 }
 
 impl Transcript {
-    /// Fold one event into the transcript.
+    /// Fold one event into the transcript. The surface gate mirrors the
+    /// web client: replacement copies and usage-only messages never render;
+    /// context messages (non-user source) render as disclosure rows.
     pub fn apply(&mut self, event: &SessionEvent) {
         match parse_event_data(event) {
             SessionEventData::TurnStart { turn } => {
                 self.current_turn = turn;
             }
-            SessionEventData::TurnEnd { turn, .. } => {
+            SessionEventData::TurnEnd { turn, reason } => {
                 if !self.finished_turns.contains(&turn) {
                     self.finished_turns.push(turn);
                 }
+                let kind = reason.get("kind").and_then(Value::as_str).unwrap_or("");
+                let marker = match kind {
+                    "max-tokens" => Some("已达最大 token".to_string()),
+                    "error" | "aborted" => Some("已停止".to_string()),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    if !self.turn_footers.iter().any(|(t, _)| *t == turn) {
+                        self.turn_footers.push((turn, marker));
+                    }
+                }
             }
             SessionEventData::UserMessage(message) => {
-                self.push_message(&message);
+                if event.is_append_surface() {
+                    self.push_message(&message);
+                }
             }
             SessionEventData::AssistantChunk { chunk, .. } => {
                 self.apply_chunk(chunk);
             }
             SessionEventData::AssistantMessage { message, .. } => {
-                self.finalize_message(&message);
+                if event.is_append_surface() && !message.is_empty() {
+                    self.finalize_message(&message);
+                }
             }
             SessionEventData::ToolCall { call_id, name, arguments, .. } => {
                 if self.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
@@ -300,9 +356,18 @@ impl Transcript {
     }
 
     fn push_message(&mut self, message: &Message) {
+        let (kind, producer, form) = if message.source_kind() == "user" {
+            (MessageKind::User, None, None)
+        } else {
+            let producer = message.source_plugin().or_else(|| message.source_form());
+            (MessageKind::Context, producer, message.source_form())
+        };
         let mut buffer = MessageBuffer {
             id: message.id.clone(),
             role: message.role.clone(),
+            kind,
+            producer,
+            form,
             ..Default::default()
         };
         for (index, block) in message.content.iter().enumerate() {

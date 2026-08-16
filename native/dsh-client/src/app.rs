@@ -1,8 +1,10 @@
-//! GUI state and rendering: session sidebar, streaming transcript,
-//! composer, model/preset pickers, approval and question modals.
+//! GUI state and rendering: session sidebar, streaming transcript with
+//! web-aligned recognition, composer with approval/question takeover,
+//! model/preset pickers, and the egui AnimationManager for motion.
 
 use crate::backend::{Backend, BackendHandle, BackendStatus, Event};
-use dsh_remote::chat::{StreamChunk, Transcript};
+use dsh_remote::chat::{parse_event_data, MessageBuffer, MessageKind, StreamChunk, Transcript};
+use std::collections::HashMap;
 use egui::containers::panel::{CentralPanel, Panel};
 use dsh_remote::domains::{ApprovalOutcome, ApprovalRequested, ModelProviderGroup, ModelSelection, PathOp, QuestionRequested};
 use dsh_remote::model::{SessionEvent, SessionSummary};
@@ -50,10 +52,10 @@ struct SettingsEditState {
     edited: Value,
 }
 
-/// One deferred modal action, applied after the borrow-heavy modal loop.
-enum ModalAction {
-    AnswerApproval { rpc_id: String, session_id: String, approval_id: String, outcome: ApprovalOutcome },
-    AnswerQuestions { index: usize },
+/// Results of background loads (history/models) delivered back to the UI thread.
+enum AsyncResult {
+    History { session_id: String, page: Result<Value, String> },
+    Models { session_id: String, value: Result<Value, String> },
 }
 
 pub struct App {
@@ -89,10 +91,20 @@ pub struct App {
     show_rename: bool,
     rename_text: String,
     jobs: Vec<(String, Value)>,
+    follow_bottom: bool,
+    at_bottom: bool,
+    force_jump: bool,
+    turn_started: Option<std::time::Instant>,
+    queue_len: usize,
+    drafts: HashMap<String, String>,
+    async_tx: std::sync::mpsc::Sender<AsyncResult>,
+    async_rx: std::sync::mpsc::Receiver<AsyncResult>,
+    history_loading: bool,
 }
 
 impl App {
     pub fn new(base: &str, _ctx: egui::Context) -> Self {
+        let (async_tx, async_rx) = std::sync::mpsc::channel();
         let mut app = App {
             backend: None,
             base_url: base.to_string(),
@@ -129,6 +141,15 @@ impl App {
             show_rename: false,
             rename_text: String::new(),
             jobs: Vec::new(),
+            follow_bottom: true,
+            at_bottom: true,
+            force_jump: false,
+            turn_started: None,
+            queue_len: 0,
+            drafts: HashMap::new(),
+            async_tx,
+            async_rx,
+            history_loading: false,
         };
         app.connect();
         app
@@ -193,47 +214,103 @@ impl App {
         }
     }
 
+    /// Switch sessions instantly: the history and model catalog load on a
+    /// background thread and land through the async channel.
     fn open_session(&mut self, session_id: &str) {
         if self.selected.as_deref() == Some(session_id) && self.history_done {
             return;
         }
         let Some(backend) = self.backend() else { return };
+        // Persist the outgoing session's draft, seed the incoming one.
+        if let Some(previous) = self.selected.as_deref() {
+            let draft = self.drafts.entry(previous.to_string()).or_default();
+            *draft = std::mem::take(&mut self.composer);
+        }
+        self.composer = self.drafts.get(session_id).cloned().unwrap_or_default();
         self.selected = Some(session_id.to_string());
         self.transcript = Transcript::default();
         self.last_seq = 0;
         self.history_done = false;
+        self.history_loading = true;
+        self.jobs.clear();
+        self.goal = None;
+        self.follow_bottom = true;
+        self.force_jump = true;
         self.scroll_bottom = true;
+        self.turn_started = None;
+        self.queue_len = 0;
 
-        if let Ok(value) = backend.call("session.history", serde_json::json!({ "sessionId": session_id })) {
-            let events = value.get("events").cloned().unwrap_or(Value::Null);
-            if let Ok(entries) = serde_json::from_value::<Vec<Value>>(events) {
-                for entry in entries {
-                    if let Ok(event) =
-                        serde_json::from_value::<SessionEvent>(entry.get("event").cloned().unwrap_or(Value::Null))
-                    {
-                        if event.seq > self.last_seq {
-                            self.last_seq = event.seq;
-                            self.transcript.apply(&event);
+        let handle = backend;
+        let tx = self.async_tx.clone();
+        let sid = session_id.to_string();
+        std::thread::spawn(move || {
+            let page = handle.call(
+                "session.history",
+                serde_json::json!({ "sessionId": sid }),
+            );
+            let _ = tx.send(AsyncResult::History { session_id: sid.clone(), page });
+            let value = handle.call(
+                "session.models",
+                serde_json::json!({ "sessionId": sid }),
+            );
+            let _ = tx.send(AsyncResult::Models { session_id: sid, value });
+        });
+    }
+
+    /// Land background history/model results for the still-selected session.
+    fn drain_async(&mut self) {
+        while let Ok(result) = self.async_rx.try_recv() {
+            match result {
+                AsyncResult::History { session_id, page } => {
+                    if self.selected.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
+                    self.history_loading = false;
+                    match page {
+                        Ok(value) => {
+                            let events = value.get("events").cloned().unwrap_or(Value::Null);
+                            if let Ok(entries) = serde_json::from_value::<Vec<Value>>(events) {
+                                for entry in entries {
+                                    if let Ok(event) = serde_json::from_value::<SessionEvent>(
+                                        entry.get("event").cloned().unwrap_or(Value::Null),
+                                    ) {
+                                        if event.seq > self.last_seq {
+                                            self.last_seq = event.seq;
+                                            self.transcript.apply(&event);
+                                        }
+                                    }
+                                }
+                            }
+                            self.history_done = true;
+                            self.follow_bottom = true;
+                        }
+                        Err(error) => {
+                            self.history_done = true;
+                            self.status = format!("历史加载失败：{error}");
+                        }
+                    }
+                }
+                AsyncResult::Models { session_id, value } => {
+                    if self.selected.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
+                    if let Ok(value) = value {
+                        self.current_model = serde_json::from_value::<ModelSelection>(
+                            value.get("current").cloned().unwrap_or(Value::Null),
+                        )
+                        .ok();
+                        self.models = serde_json::from_value::<Vec<ModelProviderGroup>>(
+                            value.get("groups").cloned().unwrap_or(Value::Null),
+                        )
+                        .ok();
+                        if let Some(current) = &self.current_model {
+                            self.picker_provider = Some(current.provider.clone());
+                            self.picker_model = Some(current.model.clone());
+                            self.picker_effort = current.reasoning_effort.clone();
                         }
                     }
                 }
             }
-        }
-        self.history_done = true;
-
-        match backend.call("session.models", serde_json::json!({ "sessionId": session_id })) {
-            Ok(value) => {
-                self.current_model =
-                    serde_json::from_value::<ModelSelection>(value.get("current").cloned().unwrap_or(Value::Null)).ok();
-                self.models =
-                    serde_json::from_value::<Vec<ModelProviderGroup>>(value.get("groups").cloned().unwrap_or(Value::Null)).ok();
-                if let Some(current) = &self.current_model {
-                    self.picker_provider = Some(current.provider.clone());
-                    self.picker_model = Some(current.model.clone());
-                    self.picker_effort = current.reasoning_effort.clone();
-                }
-            }
-            Err(error) => self.status = format!("模型目录失败：{error}"),
         }
     }
 
@@ -242,28 +319,49 @@ impl App {
             && !self.transcript.finished_turns.contains(&self.transcript.current_turn)
     }
 
-    fn send_composer(&mut self) {
+    fn send_composer(&mut self, steer: bool) {
         let Some(backend) = self.backend() else { return };
         let Some(session_id) = self.selected.clone() else { return };
         let text = self.composer.trim().to_string();
         if text.is_empty() {
             return;
         }
+        let mode = if steer { "steer" } else { "queue" };
         let payload = serde_json::json!({
             "sessionId": session_id,
-            "mode": "queue",
+            "mode": mode,
             "content": [{ "type": "text", "text": text }],
         });
         match backend.call("session.prompt", payload) {
             Ok(value) => {
                 if value.get("accepted").and_then(Value::as_bool) == Some(true) {
+                    if let Some(draft) = self
+                        .selected
+                        .as_deref()
+                        .map(|id| self.drafts.entry(id.to_string()).or_default())
+                    {
+                        draft.clear();
+                    }
                     self.composer.clear();
+                    self.follow_bottom = true;
                     self.scroll_bottom = true;
+                    if self.running() && !steer {
+                        self.status = "消息已加入队列".to_string();
+                    }
                 } else {
                     self.status = "发送被拒绝".to_string();
                 }
             }
             Err(error) => self.status = format!("发送失败：{error}"),
+        }
+    }
+
+    fn stop_generation(&mut self) {
+        let Some(backend) = self.backend() else { return };
+        let Some(session_id) = self.selected.clone() else { return };
+        match backend.call("session.cancel", serde_json::json!({ "sessionId": session_id })) {
+            Ok(_) => self.status = "已请求停止".to_string(),
+            Err(error) => self.status = format!("停止失败：{error}"),
         }
     }
 
@@ -376,6 +474,7 @@ impl App {
     // -- event handling -----------------------------------------------------
 
     fn drain(&mut self, ctx: &egui::Context) {
+        self.drain_async();
         if let Some(backend) = &self.backend {
             for event in backend.drain_events() {
                 match event {
@@ -409,6 +508,15 @@ impl App {
                     return;
                 }
                 self.last_seq = payload.event.seq;
+                match parse_event_data(&payload.event) {
+                    dsh_remote::chat::SessionEventData::TurnStart { .. } => {
+                        self.turn_started = Some(std::time::Instant::now());
+                    }
+                    dsh_remote::chat::SessionEventData::TurnEnd { .. } => {
+                        self.turn_started = None;
+                    }
+                    _ => {}
+                }
                 let is_delta = matches!(
                     dsh_remote::chat::parse_event_data(&payload.event),
                     dsh_remote::chat::SessionEventData::AssistantChunk {
@@ -474,6 +582,18 @@ impl App {
                         (id, job.clone())
                     })
                     .collect();
+            }
+            "session/queue" => {
+                let session_id = frame.payload.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+                if self.selected.as_deref() != Some(session_id) {
+                    return;
+                }
+                self.queue_len = frame
+                    .payload
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
             }
             "session/projection" => {
                 let session_id = frame.payload.get("sessionId").and_then(Value::as_str).unwrap_or_default();
@@ -766,195 +886,360 @@ impl App {
 
     fn transcript_ui(&mut self, ui: &mut egui::Ui) {
         CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let ctx = ui.ctx().clone();
+            let blank = self
+                .selected
+                .as_deref()
+                .and_then(|id| self.sessions.iter().find(|session| session.session_id == id))
+                .map(|session| session.blank)
+                .unwrap_or(true);
+
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("transcript")
                 .auto_shrink([false, false])
-                .stick_to_bottom(self.scroll_bottom)
-                .show(ui, |ui| {
-                    ui.add_space(6.0);
-                    for message in &self.transcript.messages {
-                        match message.role.as_str() {
-                            "user" => {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new("你").strong());
-                                    ui.add_space(6.0);
-                                });
-                                ui.label(egui::RichText::new(message.text()).size(15.0));
+                .animated(true);
+            if self.follow_bottom {
+                scroll = scroll.vertical_scroll_offset(f32::MAX / 4.0);
+            }
+            let output = scroll.show(ui, |ui| {
+                ui.add_space(6.0);
+                if self.history_loading {
+                    ui.spinner();
+                    ui.label("载入历史…");
+                }
+                if blank && !self.running() {
+                    ui.add_space(120.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("给智能体发消息").size(22.0).strong());
+                        ui.add_space(8.0);
+                        ui.label("描述你想要构建的内容，Enter 发送，Shift+Enter 换行");
+                    });
+                }
+                let messages = self.transcript.messages.clone();
+                for message in &messages {
+                    let appear = ctx.animate_bool_with_easing(
+                        egui::Id::new(("msg", &message.id)),
+                        true,
+                        egui::emath::easing::quadratic_out,
+                    );
+                    ui.scope(|ui| {
+                        ui.set_opacity(appear);
+                        self.render_message(ui, message);
+                    });
+                    ui.separator();
+                }
+                // Turn footers (interrupted / max-tokens).
+                for (turn, marker) in &self.transcript.turn_footers {
+                    if *turn == self.transcript.current_turn
+                        && self.transcript.finished_turns.contains(turn)
+                    {
+                        ui.colored_label(egui::Color32::from_rgb(150, 152, 160), marker);
+                    }
+                }
+                if self.running() {
+                    let time = ui.input(|input| input.time) as f32;
+                    let pulse = 0.55 + 0.45 * (time * 3.0).sin();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Deep diving…")
+                                .color(egui::Color32::from_white_alpha((pulse * 255.0) as u8)),
+                        );
+                        if let Some(started) = self.turn_started {
+                            let elapsed = started.elapsed().as_secs();
+                            if elapsed >= 15 {
+                                let minutes = elapsed / 60;
+                                let seconds = elapsed % 60;
+                                ui.label(format!("{minutes}分{seconds:02}秒"));
                             }
-                            "assistant" => {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new("助手").strong().color(egui::Color32::from_rgb(98, 148, 255)));
-                                    ui.add_space(6.0);
-                                });
-                                let text = message.text();
-                                if !text.is_empty() {
-                                    egui_commonmark::CommonMarkViewer::new()
-                                        .show(ui, &mut self.md_cache, &text);
-                                }
-                                for (key, tool) in &message.tool_calls {
-                                    egui::CollapsingHeader::new(format!("🔧 {}", tool.name))
-                                        .id_salt(("tool", key))
-                                        .show(ui, |ui| {
-                                            if !tool.arguments.is_empty() {
-                                                ui.label("参数");
-                                                ui.add(
-                                                    egui::Label::new(truncate(&tool.arguments, 2000))
-                                                        .wrap(),
-                                                );
-                                            }
-                                            if let Some(result) = &tool.result {
-                                                ui.label("结果");
-                                                ui.add(
-                                                    egui::Label::new(truncate(&result.to_string(), 4000))
-                                                        .wrap(),
-                                                );
-                                            }
-                                        });
-                                }
-                            }
-                            _ => {}
                         }
-                        ui.separator();
-                    }
-                    if self.running() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("思考中…");
-                        });
-                    }
+                    });
+                }
+            });
+
+            // Scroll contract: follow only while pinned; a reader scrolling
+            // up disarms follow and reveals the back-to-bottom button.
+            let viewport = output.inner_rect.height();
+            let distance = output.content_size.y - output.state.offset.y - viewport;
+            self.at_bottom = distance <= 24.0;
+            let user_scrolled = ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+            if self.follow_bottom && user_scrolled && !self.at_bottom {
+                self.follow_bottom = false;
+            }
+            if !self.follow_bottom && !self.at_bottom && output.content_size.y > viewport + 48.0 {
+                let appear = ctx.animate_bool(egui::Id::new("back-to-bottom"), true);
+                ui.scope(|ui| {
+                    ui.set_opacity(appear);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 0.0),
+                        egui::Layout::right_to_left(egui::Align::Max),
+                        |ui| {
+                            if ui.button("↓ 回到底部").clicked() {
+                                self.follow_bottom = true;
+                            }
+                        },
+                    );
                 });
+            }
             self.scroll_bottom = false;
         });
     }
 
+    /// One transcript row: user bubble, context disclosure, or assistant
+    /// (reasoning + markdown + tool rows). The caret blinks at the end of
+    /// the streaming assistant message.
+    fn render_message(&mut self, ui: &mut egui::Ui, message: &MessageBuffer) {
+        match message.kind {
+            MessageKind::User => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("你").strong());
+                    ui.add_space(6.0);
+                });
+                ui.label(egui::RichText::new(message.text()).size(15.0));
+            }
+            MessageKind::Context => {
+                let label = message.producer.clone().unwrap_or_else(|| "注入上下文".to_string());
+                let header = format!("📥 注入上下文 · {label}");
+                egui::CollapsingHeader::new(header)
+                    .id_salt(("ctx", &message.id))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let text = message.text();
+                        if !text.is_empty() {
+                            ui.add(egui::Label::new(truncate(&text, 4000)).wrap());
+                        } else {
+                            ui.label("（无文本内容）");
+                        }
+                    });
+            }
+            MessageKind::Assistant => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("助手")
+                            .strong()
+                            .color(egui::Color32::from_rgb(98, 148, 255)),
+                    );
+                    ui.add_space(6.0);
+                });
+                let reasoning = message.reasoning();
+                if !reasoning.is_empty() {
+                    let first_line = reasoning.lines().next().unwrap_or_default();
+                    let preview = truncate(first_line, 80);
+                    egui::CollapsingHeader::new(format!("💭 思考过程 · {preview}"))
+                        .id_salt(("reason", &message.id))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(&reasoning).wrap());
+                        });
+                }
+                let mut text = message.text();
+                let is_live = self.running()
+                    && self
+                        .transcript
+                        .messages
+                        .last()
+                        .map(|last| last.id == message.id)
+                        .unwrap_or(false);
+                if is_live && !text.is_empty() {
+                    // Blinking caret at the end of the streaming message.
+                    let time = ui.input(|input| input.time) as f32;
+                    if (time * 4.0).sin() > 0.0 {
+                        text.push('▌');
+                    }
+                }
+                if !text.is_empty() {
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md_cache, &text);
+                }
+                for (key, tool) in &message.tool_calls {
+                    let (status_icon, state) = match (&tool.result, &tool.error) {
+                        (None, None) => ("⏳", "运行中"),
+                        (Some(_), Some(_)) => ("✗", "失败"),
+                        (Some(_), None) => ("✓", "完成"),
+                        _ => ("", ""),
+                    };
+                    let label = format!("🔧 {status_icon} {}", tool.name);
+                    egui::CollapsingHeader::new(label)
+                        .id_salt(("tool", key))
+                        .show(ui, |ui| {
+                            ui.label(state);
+                            if !tool.arguments.is_empty() {
+                                ui.label("参数");
+                                ui.add(egui::Label::new(truncate(&tool.arguments, 2000)).wrap());
+                            }
+                            if let Some(result) = &tool.result {
+                                ui.label("结果");
+                                ui.add(egui::Label::new(truncate(&result.to_string(), 4000)).wrap());
+                            }
+                        });
+                }
+            }
+        }
+    }
+
     fn composer_ui(&mut self, ui: &mut egui::Ui) {
         Panel::bottom("composer").resizable(true).show(ui, |ui| {
-            ui.add_space(4.0);
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut self.composer)
-                    .desired_rows(3)
-                    .hint_text("输入消息，Enter 发送，Shift+Enter 换行"),
-            );
-            let send_clicked = ui.button("发送").clicked();
-            let send_key = ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift)
-                && response.has_focus();
-            if send_clicked || send_key {
-                self.send_composer();
-                response.request_focus();
+            ui.add_space(6.0);
+            // Takeover chain: a pending question wins over a pending
+            // approval; both fully replace the input area (web contract).
+            if !self.questions.is_empty() {
+                self.question_composer(ui);
+            } else if !self.approvals.is_empty() {
+                self.approval_composer(ui);
+            } else {
+                self.input_composer(ui);
             }
-            ui.add_space(4.0);
+            ui.add_space(6.0);
         });
     }
 
-    fn modals(&mut self, ctx: &egui::Context) {
-        let mut actions: Vec<ModalAction> = Vec::new();
-
-        let mut remove_approvals: Vec<usize> = Vec::new();
-        for (index, pending) in self.approvals.iter().enumerate() {
-            let mut open = true;
-            egui::Window::new(format!("审批请求 · {}", pending.request.tool_name))
-                .id(egui::Id::new(("approval", &pending.request.approval_id)))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(format!("会话 {}", short_id(&pending.request.session_id)));
-                    if let Some(reason) = &pending.request.reason {
-                        ui.add(egui::Label::new(reason).wrap());
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("允许一次").clicked() {
-                            actions.push(ModalAction::AnswerApproval {
-                                rpc_id: pending.rpc_id.clone(),
-                                session_id: pending.request.session_id.clone(),
-                                approval_id: pending.request.approval_id.clone(),
-                                outcome: ApprovalOutcome::AllowedOnce,
-                            });
-                        }
-                        if ui.button("拒绝").clicked() {
-                            actions.push(ModalAction::AnswerApproval {
-                                rpc_id: pending.rpc_id.clone(),
-                                session_id: pending.request.session_id.clone(),
-                                approval_id: pending.request.approval_id.clone(),
-                                outcome: ApprovalOutcome::Rejected,
-                            });
-                        }
-                    });
-                });
-            if !open {
-                remove_approvals.push(index);
-            }
-        }
-        for index in remove_approvals.into_iter().rev() {
-            self.approvals.remove(index);
-        }
-
-        let mut remove_questions: Vec<usize> = Vec::new();
-        for (index, pending) in self.questions.iter_mut().enumerate() {
-            let mut open = true;
-            let mut submit = false;
-            egui::Window::new("需要回答")
-                .id(egui::Id::new(("question", &pending.rpc_id)))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    let questions = pending.questions.as_array().cloned().unwrap_or_default();
-                    for (question_index, question) in questions.iter().enumerate() {
-                        let draft = pending.drafts.get_mut(question_index);
-                        let header = question.get("header").and_then(Value::as_str).unwrap_or("问题");
-                        let text = question.get("question").and_then(Value::as_str).unwrap_or("");
-                        let multi = question.get("multi_select").and_then(Value::as_bool).unwrap_or(false);
-                        ui.label(egui::RichText::new(header).strong());
-                        ui.add(egui::Label::new(text).wrap());
-                        let options = question.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
-                        if let Some(draft) = draft {
-                            for option in &options {
-                                let label = option.get("label").and_then(Value::as_str).unwrap_or("?");
-                                let mut checked = draft.selected.contains(&label.to_string());
-                                if ui.checkbox(&mut checked, label).changed() {
-                                    if checked {
-                                        if !multi {
-                                            draft.selected.clear();
-                                        }
-                                        draft.selected.push(label.to_string());
-                                    } else {
-                                        draft.selected.retain(|selected| selected != label);
-                                    }
-                                }
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("其他说明");
-                                ui.text_edit_singleline(&mut draft.custom);
-                            });
-                        } else {
-                            ui.label("（选项渲染失败）");
-                        }
-                        ui.separator();
-                    }
-                    if ui.button("提交回答").clicked() {
-                        submit = true;
-                    }
-                });
-            if submit {
-                actions.push(ModalAction::AnswerQuestions { index });
-            }
-            if !open {
-                remove_questions.push(index);
-            }
-        }
-        for index in remove_questions.into_iter().rev() {
-            self.questions.remove(index);
-        }
-
-        for action in actions {
-            match action {
-                ModalAction::AnswerApproval { rpc_id, session_id, approval_id, outcome } => {
-                    self.answer_approval(&rpc_id, &session_id, &approval_id, outcome);
+    /// Pending approval replaces the composer: amber strip, reason, actions.
+    fn approval_composer(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = self.approvals.first() else { return };
+        let rpc_id = pending.rpc_id.clone();
+        let session_id = pending.request.session_id.clone();
+        let approval_id = pending.request.approval_id.clone();
+        let reason = pending
+            .request
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("工具 {} 请求越权执行", pending.request.tool_name));
+        let mut action: Option<ApprovalOutcome> = None;
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::from_rgb(245, 185, 68), "●");
+            ui.label(egui::RichText::new("等待审批").strong());
+        });
+        ui.add(egui::Label::new(reason).wrap());
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("允许一次").clicked() {
+                    action = Some(ApprovalOutcome::AllowedOnce);
                 }
-                ModalAction::AnswerQuestions { index } => self.answer_questions(index),
-            }
+                if ui.button("拒绝").clicked() {
+                    action = Some(ApprovalOutcome::Rejected);
+                }
+            });
+        });
+        if let Some(outcome) = action {
+            self.answer_approval(&rpc_id, &session_id, &approval_id, outcome);
         }
     }
+
+    /// Pending ask-user questions replace the composer (pager + options).
+    fn question_composer(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = self.questions.first_mut() else { return };
+        let questions = pending.questions.as_array().cloned().unwrap_or_default();
+        let mut submit = false;
+        let mut skip = false;
+        for (question_index, question) in questions.iter().enumerate() {
+            let draft = pending.drafts.get_mut(question_index);
+            let header = question.get("header").and_then(Value::as_str).unwrap_or("问题");
+            let text = question.get("question").and_then(Value::as_str).unwrap_or("");
+            let multi = question.get("multi_select").and_then(Value::as_bool).unwrap_or(false);
+            ui.label(egui::RichText::new(format!("{header} {}/{}", question_index + 1, questions.len())).strong());
+            ui.add(egui::Label::new(text).wrap());
+            let options = question.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(draft) = draft {
+                for option in &options {
+                    let label = option.get("label").and_then(Value::as_str).unwrap_or("?");
+                    let mut checked = draft.selected.contains(&label.to_string());
+                    if ui.checkbox(&mut checked, label).changed() {
+                        if checked {
+                            if !multi {
+                                draft.selected.clear();
+                            }
+                            draft.selected.push(label.to_string());
+                        } else {
+                            draft.selected.retain(|selected| selected != label);
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("其他说明");
+                    ui.text_edit_singleline(&mut draft.custom);
+                });
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("提交回答").clicked() {
+                    submit = true;
+                }
+                if ui.button("跳过").clicked() {
+                    skip = true;
+                }
+            });
+        });
+        if submit {
+            let index = 0;
+            self.answer_questions(index);
+        }
+        if skip {
+            // Skip = cancel the batch: answer with an empty answer set.
+            let Some(pending) = self.questions.first() else { return };
+            let (rpc_id, session_id) = (pending.rpc_id.clone(), pending.session_id.clone());
+            let value = serde_json::json!({
+                "sessionId": session_id,
+                "answer": { "answers": [] },
+            });
+            if let Some(backend) = self.backend() {
+                let _ = backend.client().respond(&rpc_id, value);
+            }
+            self.questions.remove(0);
+        }
+    }
+
+    /// The ordinary input area (web contract: Enter queues while running,
+    /// Cmd/Ctrl+Enter steers, the primary button toggles Send/Stop, drafts
+    /// are per-session, empty drafts no-op).
+    fn input_composer(&mut self, ui: &mut egui::Ui) {
+        let running = self.running();
+        if running && self.queue_len > 0 {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("⏸ {} 条排队消息", self.queue_len)).weak());
+            });
+        }
+        let placeholder = if running {
+            "正在生成中 — Enter 将消息加入队列，Cmd/Ctrl+Enter 插话"
+        } else {
+            "给智能体发消息"
+        };
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut self.composer)
+                .desired_rows(3)
+                .hint_text(placeholder),
+        );
+        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift && !input.modifiers.command)
+            && response.has_focus();
+        let steer = ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift && input.modifiers.command)
+            && response.has_focus();
+        let mut send = false;
+        let mut stop = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if running {
+                    if ui.button("■ 停止").clicked() {
+                        stop = true;
+                    }
+                } else {
+                    let empty = self.composer.trim().is_empty();
+                    if ui.add_enabled(!empty, egui::Button::new("↑ 发送")).clicked() {
+                        send = true;
+                    }
+                }
+            });
+        });
+        if stop {
+            self.stop_generation();
+            response.request_focus();
+        }
+        if send || enter || steer {
+            if !self.composer.trim().is_empty() {
+                self.send_composer(steer);
+            }
+            response.request_focus();
+        }
+    }
+
 }
 
 impl App {
@@ -1157,7 +1442,6 @@ impl eframe::App for App {
             }
         }
         self.drain(&ctx);
-        self.modals(&ctx);
         self.rename_dialog(&ctx);
         self.settings_window(&ctx);
         self.goal_dialog(&ctx);

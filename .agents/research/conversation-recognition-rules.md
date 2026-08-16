@@ -1,0 +1,36 @@
+# Conversation recognition rules
+
+**Source of truth:** the append-only session event log. A client-side `ConversationNodeAssembler` (packages/client/runtime/src/client/sessions/conversation-assembler.ts) folds contiguous events through registered `ConversationNodeDefinition`s (`match` → `start`/`update` → `buildViewNode`) into keyed business Contexts, then emits Chat view nodes sorted by `anchorSeq`. All business rules below live in packages/client/ui-conversation/src/client/conversation-nodes/ (register.ts registers them).
+
+## 1. Surface gate (which events can ever become nodes)
+
+Only three types are surface-eligible — `user/message`, `assistant/message`, `tool/result` (packages/core/session/src/surface.ts). An event is a transcript candidate **iff** it also carries `surfaceOp === 'append'` (`isAppendSurfaceEvent`). Replacement copies (`surfaceOp = {op:'replace'}`) stay model-only — they shadow history the user already saw (compaction). Non-surface events (chunks, boundaries, log-only records) never become nodes directly. Any unclaimed append-surface event falls back to an `unknown` node (`fallback.ts`, id = event seq).
+
+## 2. Event type → node kind (exact match predicates)
+
+- **`user/message` (append, not a compact checkpoint)** → `input-message` node (message.ts). Checkpoint exclusion: replacement surface event whose `data.source = {kind:'plugin', plugin:'compact'}` (message.ts:24). id = `data.id`. Node subtype: `source.kind !== 'user'` → `context`; else `user` unless the message id is claimed by the `inbox-next-step` splice state (`agent/inbox/spliced` target `next-step`, inbox.ts) → `steering`.
+- **`step/start`** → starts `assistant-step` (assistant.ts), id `${turn}:${step}`; **`assistant/chunk`** (any) and **`assistant/message`** (append only) → update it; **`llm/retry`** → update (resets blocks, hides). Assistant content blocks classify: `text`→markdown, `reasoning`→Think row, `image`→gallery, `tool-call`→skipped (rendered via the tool node), other→JSON (AssistantMarkdown.tsx). Empty/final-less steps stay `visibility:'hidden'`; an interrupted turn (no final) freezes a partial node at `turn/end` seq −0.9 with a 已停止 marker.
+- **`tool/call`** → starts `tool-call` (tool.ts), id = `data.callId`; **`tool/result`** (append) → update, id = `message.source.callId`; **`tool/code-dispatch-start` / `tool/code-dispatch`** → update, id = `rootCallId` (non-empty), nesting subcalls. The result backfills the call head from the in-window `tool/call`; a result whose call fell outside the window renders with `call: null`.
+- **`command/run`** → starts `command` (command.ts), id = `commandId`; **`command/done`** → update. A `compact` command, or compaction events carrying `sourceCommandId`, renders as `manual-compaction`.
+- **`compaction/start`** → starts `compaction` (compaction.ts), id = `compactionId` (or `sourceCommandId` for command-driven); **`compaction/summary`, `compaction/end`**, and the replacement `user/message` checkpoint (`source.plugin==='compact'`, no `sourceCommandId`) → update. The node materializes only at the checkpoint, anchored at the checkpoint event's seq; the summary text (and shadowed counts) come from the cited `compaction/summary`. The replaced history stays visible above the marker.
+- **`llm/retry`** (retry===1 → start; else update) and **`llm/retry-started`** → `model-retry`, id = `retryId`.
+- **`turn/start`** → starts `turn-error` (id = turn) and `turn-tail`; **`turn/end`** with `reason.kind==='error'` → update `turn-error` (suppressed — kept hidden — when the turn has an `llm/retry` chain); `reason.kind==='max-tokens'` → `turn-max-tokens`. `turn-tail` consumes `turn/end`, `tool/call`, `tool/result`, `assistant/message`/chunk, `step/end`, `llm/retry` to build the turn footer.
+
+## 3. CONTEXT messages: separate row, not a bubble
+
+`user/message` with `source.kind !== 'user'` → `ContextMessageNode`, rendered as a collapsed disclosure row (ContextInjectionRow.tsx) — header `注入上下文`/recall variant `引用会话` + producer label, expandable body per form. Provenance (context-provenance.ts, from durable `source` alone): role `recall` iff `source.kind==='session-reference'`, else `inject`; label: `plugin`→`source.plugin`, `agent-instructions`→joined `changes[].path`, `session-reference`→joined `references[].label`, `skill-invocation`→`name`, unknown kind→the kind itself, unreadable→null. Form: `source.form` ∈ {`instructions`, `catalog`, `snapshot`, `notice`, `relay`, `recall`} → form-specific body; absent/unknown → opaque JSON body.
+
+## 4. Auxiliary model calls are excluded by event type, not id
+
+`step/start`, `assistant/chunk`, `assistant/message` are appended **only** by the agent loop (packages/core/agent-loop/src/agent.ts:279,349,381). Auxiliary calls bypass the loop entirely, so they produce no step/assistant events:
+- **Session title:** packages/session/session-title-llm/src/index.ts:262 appends the log-only `session/title-llm-request` (not surface-eligible → never a node) and streams via `ctx.llm.stream()` with envelope `purpose:'session-title'` (line 259). Purpose lives on the LLM request, never in session events.
+- **Compaction summary:** packages/compaction/compaction-basic/src/summarizer.ts:164 streams via `ctx.llm.stream()` (`purpose:'compaction'`), emitting only `compaction/start|summary|end` + the replacement checkpoint. An empty-content `assistant/message` (usage-only, max-tokens carrier) projects no history (surface.ts:103) and stays hidden.
+**Rule for a port:** an event belongs to the visible conversation iff it is a surface-eligible type with `surfaceOp==='append'`, plus the compaction/command/retry/error boundary events mapped in §2. Ignore every other event type (chunks, boundaries, `session/title-llm-request`, `web/*-llm-request`).
+
+## 5. Assistant reasoning
+
+Reasoning blocks (finalized `type:'reasoning'` content or streamed `reasoning-delta`) accumulate into `kind:'reasoning'` blocks (partial.ts / assistant.ts) and render **inline, collapsed** as a "Think" disclosure row (ReasoningRow.tsx): collapsed shows first line (settled) or latest line (running); expand reveals the full text. Never hidden by default.
+
+## 6. Tool call + result layout
+
+Tool-call blocks inside assistant content are **dropped from the message body** (AssistantMarkdown.tsx:89). The tool row is a separate `tool-call` node (ToolCallTree, ui-tool) anchored at its own `tool/call` event seq, which logs **after** the `assistant/message` in a tool-ordering step — so ordering is by log seq (`anchorSeq`), not block index; the row keeps the call's position when the result lands. Interleaving with text is purely seq-driven (chat-snapshot-builder.ts:138 sorts visible nodes by `anchorSeq`). Result-only windows anchor at the `tool/result` seq. Synthetic fractional anchors: interrupted assistant −0.9, its follow-ups −0.8, max-tokens notice +0.05, finalized follow-up +0.1 (common.ts:14). Tool row presentation is a pure function of the frozen slice (tool-call-model.ts): variant from tool name (`bash|pwsh`→Bash, `read|web_fetch|cordis_*_inspect`→Read, `web_search|grep|glob`→Search, `write`→Write, `edit`→Edit, `run_code`→Code, else Tool call), state running/ok/error/stopped, args-derived summary/body, flattened result text.
