@@ -1,0 +1,20 @@
+[package]
+name = "dsh-web-client"
+version = "0.1.0"
+description = "DeepSeek Harness desktop client: React page over the Rust core"
+authors = ["jkesh"]
+edition = "2021"
+
+[lib]
+name = "dsh_web_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+dsh-remote = { path = "../../native/dsh-remote" }

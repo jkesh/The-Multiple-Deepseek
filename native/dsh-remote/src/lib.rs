@@ -119,7 +119,7 @@ pub struct ServerResponse {
 }
 
 /// Incoming server-initiated message: event frame or answerable push.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServerRequest {
     #[serde(rename = "type")]
     pub typ: String,
@@ -140,7 +140,7 @@ struct ClientResponse {
 }
 
 /// Receipt returned by `POST /api/respond`.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RespondReceipt {
     pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
