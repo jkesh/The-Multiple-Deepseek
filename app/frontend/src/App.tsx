@@ -6,8 +6,9 @@ import SessionList from './components/SessionList'
 import Transcript from './components/Transcript'
 import Composer from './components/Composer'
 import StatusBar from './components/StatusBar'
+import SettingsView from './components/SettingsView'
 import { backendStatus, onBackendStatus, onFrame, rpc, respond, startBackend, stopBackend } from './core'
-import type { BackendStatus, Frame, Message, PendingApproval, PendingQuestion, SessionEvent, SessionSummary } from './types'
+import type { BackendStatus, Frame, Message, ModelSelection, PendingApproval, PendingQuestion, SessionEvent, SessionSummary, WorkspaceView } from './types'
 import { applyEvent, blankTranscript } from './transcript'
 
 export default function App() {
@@ -21,6 +22,9 @@ export default function App() {
   const [approvals, setApprovals] = useState<PendingApproval[]>([])
   const [questions, setQuestions] = useState<PendingQuestion[]>([])
   const [statusText, setStatusText] = useState('connecting')
+  const [view, setView] = useState<'sessions' | 'settings'>('sessions')
+  const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([])
+  const [currentModel, setCurrentModel] = useState<ModelSelection | null>(null)
   const lastSeq = useRef(0)
   const selectedRef = useRef<string | null>(null)
   selectedRef.current = selected
@@ -30,6 +34,8 @@ export default function App() {
     try {
       const value = (await rpc('session.list', {})) as { items?: SessionSummary[] }
       setSessions(value.items ?? [])
+      const workspaceValue = (await rpc('workspace.list', {})) as { items?: WorkspaceView[] }
+      setWorkspaces(workspaceValue.items ?? [])
       setStatusText('已连接')
     } catch (error) {
       setStatusText('会话列表失败：' + String(error))
@@ -57,6 +63,12 @@ export default function App() {
       }
       setMessages(transcript.messages)
       setRunning(transcript.running)
+      try {
+        const models = (await rpc('session.models', { sessionId })) as { current?: ModelSelection }
+        setCurrentModel(models.current ?? null)
+      } catch {
+        setCurrentModel(null)
+      }
     } catch (error) {
       setStatusText('历史加载失败：' + String(error))
     } finally {
@@ -215,32 +227,49 @@ export default function App() {
     }
   }, [openSession, refreshSessions])
 
+  const currentModelLabel = currentModel
+    ? currentModel.provider + ' / ' + currentModel.model
+    : null
+
   return (
     <div className="app">
       <StatusBar
         status={status}
         statusText={statusText}
+        settingsOpen={view === 'settings'}
         onStart={() => startBackend().then(setStatus)}
         onStop={() => stopBackend().then(setStatus)}
         onNew={newSession}
+        onToggleSettings={() => setView((previous) => (previous === 'settings' ? 'sessions' : 'settings'))}
       />
       <div className="body">
-        <SessionList
-          sessions={sessions}
-          selected={selected}
-          onSelect={openSession}
-          onRefresh={refreshSessions}
-        />
+        {view === 'settings' ? (
+          <SettingsView
+            sessionId={selected}
+            onBack={() => setView('sessions')}
+            onStatus={setStatusText}
+          />
+        ) : (
+          <SessionList
+            sessions={sessions}
+            workspaces={workspaces}
+            selected={selected}
+            onSelect={openSession}
+            onRefresh={refreshSessions}
+          />
+        )}
         <main className="conversation">
           <Transcript messages={messages} loading={historyLoading} running={running} blank={!selected} />
         </main>
         <Composer
           running={running}
           queueLen={queueLen}
+          currentModel={currentModelLabel}
           approvals={approvals}
           questions={questions}
           onSend={send}
           onStop={stop}
+          onOpenModel={() => setView('settings')}
           onAnswerApproval={answerApproval}
           onAnswerQuestions={answerQuestions}
         />

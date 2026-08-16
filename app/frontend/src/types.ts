@@ -34,6 +34,59 @@ export interface BackendStatus {
   base: string
 }
 
+export interface WorkspaceView {
+  workspaceId: string
+  path: string
+  title: string
+  sessionIds: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SettingsSecret {
+  path: string[]
+  set: boolean
+}
+
+export interface SettingsNamespace {
+  ns: string
+  schema: unknown
+  value: unknown
+  base?: unknown
+  user?: unknown
+  applies: 'live' | 'restart'
+  secrets: SettingsSecret[]
+  revision: number
+}
+
+export interface ModelProviderGroup {
+  id: string
+  name: string
+  models: ModelCatalogModel[]
+}
+
+export interface ModelCatalogModel {
+  id: string
+  name?: string
+  description?: string
+  reasoning?: { efforts: { id: string; name: string }[]; defaultEffort?: string }
+}
+
+export interface ModelSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+export interface AgentPresetEntry {
+  id: string
+  trust: 'system' | 'user'
+  isDefault: boolean
+  name?: string
+  description?: string
+  broken?: string
+}
+
 export interface ToolView {
   id: string
   name: string
